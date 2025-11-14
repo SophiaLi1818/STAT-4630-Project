@@ -1,0 +1,280 @@
+---
+title: "LASSO"
+output: html_document
+date: "2025-11-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r}
+library(tidyverse)
+library(glmnet)
+
+
+metabric <- read.csv("C:/Users/afw3uz/Downloads/metabric.csv", stringsAsFactors = FALSE)
+
+str(metabric)
+```
+
+```{r}
+
+
+outcome_col <- "overall_survival"
+
+metabric[[outcome_col]] <- as.integer(metabric[[outcome_col]])
+
+metabric <- metabric[!is.na(metabric[[outcome_col]]), ]
+
+table(metabric[[outcome_col]])
+
+exclude_vars <- c(
+  "patient_id",
+  "overall_survival",          
+  "overall_survival_months",   
+  "death_from_cancer",         
+  "cancer_type"                
+)
+
+exclude_vars <- intersect(exclude_vars, names(metabric))
+
+predictor_vars <- setdiff(names(metabric), exclude_vars)
+
+predictors <- metabric[, predictor_vars]
+
+char_cols <- sapply(predictors, is.character)
+predictors[char_cols] <- lapply(predictors[char_cols], function(x) {
+  x[x == ""] <- NA
+  x
+})
+
+
+non_all_na <- colSums(!is.na(predictors)) > 0
+predictors <- predictors[, non_all_na, drop = FALSE]
+
+char_cols2 <- sapply(predictors, is.character)
+predictors[char_cols2] <- lapply(predictors[char_cols2], factor)
+
+is_fac <- sapply(predictors, is.factor)
+fac_ok <- rep(TRUE, ncol(predictors))
+fac_ok[is_fac] <- sapply(predictors[is_fac], function(x) nlevels(x) >= 2)
+
+predictors <- predictors[, fac_ok, drop = FALSE]
+
+X <- model.matrix(~ ., data = predictors)[, -1]  
+y <- metabric[[outcome_col]]
+
+dim(X)
+head(X[, 1:10])
+
+
+```
+
+```{r}
+
+keep_rows <- complete.cases(predictors)
+
+sum(keep_rows)      
+sum(!keep_rows)     
+
+predictors_cc <- predictors[keep_rows, , drop = FALSE]
+y_cc          <- y[keep_rows]
+
+
+X <- model.matrix(~ ., data = predictors_cc)[, -1]  
+
+nrow(X)        
+length(y_cc)
+
+
+```
+
+```{r}
+set.seed(123)
+
+cv_lasso <- cv.glmnet(
+  x = X,
+  y = y_cc,
+  family = "binomial",
+  alpha = 1,
+  nfolds = 10,
+  type.measure = "auc"
+)
+```
+
+```{r}
+plot(cv_lasso)
+
+coef_1se <- coef(cv_lasso, s = "lambda.1se")
+
+coef_df <- data.frame(
+  feature     = rownames(coef_1se),
+  coefficient = as.numeric(coef_1se)
+) |>
+  dplyr::filter(coefficient != 0) |>
+  dplyr::arrange(dplyr::desc(abs(coefficient)))
+
+coef_df
+
+```
+```{r}
+plot(cv_lasso$glmnet.fit,
+     xvar = "lambda",
+     label = FALSE,
+     main = "LASSO Coefficient Paths")
+```
+```{r}
+roc_obj <- roc(y_cc, as.numeric(prob))
+
+plot(roc_obj,
+     col = "blue",
+     lwd = 2,
+     main = paste0("ROC Curve for LASSO (AUC = ",
+                   round(auc(roc_obj), 3), ")"))
+```
+```{r}
+coef_df <- data.frame(
+  feature = rownames(coef_1se),
+  coef    = as.numeric(coef_1se)
+)
+
+coef_df <- subset(coef_df, feature != "(Intercept)" & coef != 0)
+coef_df$abscoef <- abs(coef_df$coef)
+
+
+ggplot(coef_df,
+       aes(x = reorder(feature, abscoef), y = abscoef)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "LASSO Feature Importance (|Coefficient| at lambda.1se)",
+    x = "Feature",
+    y = "Absolute Coefficient"
+  ) +
+  theme_minimal(base_size = 11)
+
+```
+```{r}
+df_prob <- data.frame(
+  prob    = as.numeric(prob),
+  outcome = factor(y_cc, levels = c(0, 1),
+                   labels = c("Non-survival", "Survival"))
+)
+
+ggplot(df_prob, aes(x = prob, fill = outcome)) +
+  geom_histogram(alpha = 0.6, position = "identity", bins = 30) +
+  labs(
+    title = "Distribution of Predicted Probabilities by Outcome",
+    x = "Predicted P(Survival = 1)",
+    y = "Count",
+    fill = "True Outcome"
+  ) +
+  theme_minimal(base_size = 11)
+
+```
+
+```{r}
+cm <- confusionMatrix(
+  factor(pred, levels = c(0, 1)),
+  factor(y_cc, levels = c(0, 1))
+)
+
+cm$table  
+
+cm_df <- as.data.frame(cm$table)
+colnames(cm_df) <- c("Reference", "Prediction", "Freq")
+
+ggplot(cm_df, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), color = "white", size = 6) +
+  scale_fill_gradient(low = "grey40", high = "steelblue") +
+  labs(
+    title = "Confusion Matrix (LASSO at lambda.1se)",
+    x = "True Class",
+    y = "Predicted Class"
+  ) +
+  theme_minimal(base_size = 11)
+
+```
+
+```{r}
+
+library(pROC)
+library(caret)
+
+```
+
+```{r}
+
+
+library(caret)
+library(pROC)
+library(glmnet)
+
+set.seed(123)
+
+folds <- createMultiFolds(y_cc, k = 5, times = 3)
+
+results <- data.frame(
+  Accuracy = numeric(),
+  F1_Macro = numeric(),
+  AUC = numeric()
+)
+
+for (i in seq_along(folds)) {
+  
+  train_idx <- folds[[i]]
+  X_train <- X[train_idx, ]
+  y_train <- y_cc[train_idx]
+  
+  X_test  <- X[-train_idx, ]
+  y_test  <- y_cc[-train_idx]
+  
+  cv_lasso_cv <- cv.glmnet(
+    x = X_train,
+    y = y_train,
+    family = "binomial",
+    alpha = 1,
+    nfolds = 5,
+    type.measure = "auc"
+  )
+  
+  prob_test <- predict(
+    cv_lasso_cv,
+    newx = X_test,
+    s = "lambda.1se",
+    type = "response"
+  )
+  pred_test <- ifelse(prob_test >= 0.5, 1, 0)
+
+  acc <- mean(pred_test == y_test)
+  
+  pred_fac <- factor(pred_test, levels = c(0, 1))
+  y_fac    <- factor(y_test,    levels = c(0, 1))
+
+  f1_1 <- F_meas(data = pred_fac, reference = y_fac, relevant = "1")
+  f1_0 <- F_meas(data = pred_fac, reference = y_fac, relevant = "0")
+  
+  f1_macro <- (f1_1 + f1_0) / 2
+  
+  roc_obj <- roc(y_test, as.numeric(prob_test))
+  auc_val <- auc(roc_obj)
+  
+  results <- rbind(
+    results,
+    data.frame(Accuracy = acc, F1_Macro = f1_macro, AUC = auc_val)
+  )
+}
+
+results
+
+colMeans(results)
+
+```
