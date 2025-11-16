@@ -1,0 +1,820 @@
+---
+title: "LASSO"
+output: html_document
+date: "2025-11-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r}
+
+library(glmnet)
+library(caret)
+library(pROC)
+library(splines)
+```
+
+```{r}
+metabric <- read.csv("C:/Users/afw3uz/Downloads/metabric.csv", stringsAsFactors = FALSE)
+```
+#Outcome and Basic Setup
+```{r}
+outcome_col <- "overall_survival"
+
+metabric[[outcome_col]] <- as.integer(metabric[[outcome_col]])
+metabric <- metabric[!is.na(metabric[[outcome_col]]), ]
+
+y <- metabric[[outcome_col]]
+
+```
+
+#Build predictors data frame
+```{r}
+exclude_vars <- c(
+  "patient_id",
+  "overall_survival",          
+  "overall_survival_months",   
+  "death_from_cancer",         
+  "cancer_type"                
+)
+
+exclude_vars <- intersect(exclude_vars, names(metabric))
+predictor_vars <- setdiff(names(metabric), exclude_vars)
+
+predictors <- metabric[, predictor_vars, drop = FALSE]
+```
+
+# 3. Clean categoricals ("" -> NA, then factor)
+```{r}
+char_cols <- sapply(predictors, is.character)
+
+predictors[char_cols] <- lapply(predictors[char_cols], function(x) {
+  x[x == ""] <- NA
+  x
+})
+
+predictors[char_cols] <- lapply(predictors[char_cols], factor)
+```
+
+## 4. Impute numeric predictors (median)
+```{r}
+num_cols <- sapply(predictors, is.numeric)
+
+pre_num <- preProcess(
+  predictors[, num_cols, drop = FALSE],
+  method = c("medianImpute")
+)
+
+predictors_num_imp <- predict(pre_num, predictors[, num_cols, drop = FALSE])
+```
+
+```{r}
+predictors_cat <- predictors[, !num_cols, drop = FALSE]
+fac_cols <- sapply(predictors_cat, is.factor)
+
+predictors_cat[fac_cols] <- lapply(predictors_cat[fac_cols], function(x) {
+  x <- addNA(x)
+  lev <- levels(x)
+  lev[is.na(lev)] <- "Missing"
+  levels(x) <- lev
+  x
+})
+
+merge_rare_levels <- function(f, min_count = 10) {
+  tab <- table(f)
+  rare_levels <- names(tab[tab < min_count])
+  if (length(rare_levels) > 0) {
+    f <- factor(ifelse(f %in% rare_levels, "Other", as.character(f)))
+  } else {
+    f <- factor(f)
+  }
+  f
+}
+
+predictors_cat[fac_cols] <- lapply(predictors_cat[fac_cols], merge_rare_levels)
+
+```
+
+#PCA
+```{r}
+gene_cols <- names(predictors_num_imp)[
+  grepl("^[a-z0-9]+$", names(predictors_num_imp)) &
+  sapply(predictors_num_imp, is.numeric)
+]
+
+clinical_num_cols <- setdiff(names(predictors_num_imp), gene_cols)
+
+if (length(gene_cols) > 0) {
+  mut_mat <- as.matrix(predictors_num_imp[, gene_cols, drop = FALSE])
+
+  pca_obj <- prcomp(mut_mat, center = TRUE, scale. = TRUE)
+  
+
+  k_pc <- min(20, ncol(pca_obj$x))
+  mut_pc <- pca_obj$x[, 1:k_pc, drop = FALSE]
+  
+  colnames(mut_pc) <- paste0("PC_mut_", seq_len(k_pc))
+} else {
+  mut_pc <- NULL
+}
+
+
+clinical_num <- predictors_num_imp[, clinical_num_cols, drop = FALSE]
+
+```
+
+```{r}
+predictors_base <- cbind(
+  clinical_num,
+  mut_pc,
+  predictors_cat
+)
+
+```
+
+```{r}
+if ("tumor_size" %in% colnames(predictors_base)) {
+  predictors_base$log_tumor_size <- log1p(predictors_base$tumor_size)
+  predictors_base$tumor_size2    <- predictors_base$tumor_size^2
+}
+
+if ("age_at_diagnosis" %in% colnames(predictors_base)) {
+  predictors_base$log_age <- log1p(predictors_base$age_at_diagnosis)
+  predictors_base$age2    <- predictors_base$age_at_diagnosis^2
+}
+
+if ("lymph_nodes_examined_positive" %in% colnames(predictors_base)) {
+  predictors_base$nodes2 <- predictors_base$lymph_nodes_examined_positive^2
+}
+
+```
+
+#Splines
+```{r}
+
+if ("age_at_diagnosis" %in% colnames(predictors_base)) {
+  age_spl <- ns(predictors_base$age_at_diagnosis, df = 4)
+  colnames(age_spl) <- paste0("age_spline_", 1:4)
+  predictors_base <- cbind(predictors_base, age_spl)
+}
+
+if ("tumor_size" %in% colnames(predictors_base)) {
+  ts_spl <- ns(predictors_base$tumor_size, df = 4)
+  colnames(ts_spl) <- paste0("tumor_spline_", 1:4)
+  predictors_base <- cbind(predictors_base, ts_spl)
+}
+
+if ("lymph_nodes_examined_positive" %in% colnames(predictors_base)) {
+  ln_spl <- ns(predictors_base$lymph_nodes_examined_positive, df = 4)
+  colnames(ln_spl) <- paste0("ln_spline_", 1:4)
+  predictors_base <- cbind(predictors_base, ln_spl)
+}
+
+```
+```{r}
+if (all(c("age_at_diagnosis", "tumor_size") %in% colnames(predictors_base))) {
+  predictors_base$age_tumor <- predictors_base$age_at_diagnosis *
+    predictors_base$tumor_size
+}
+
+if (all(c("neoplasm_histologic_grade", "tumor_size") %in% colnames(predictors_base))) {
+  predictors_base$grade_tumor <- predictors_base$neoplasm_histologic_grade *
+    predictors_base$tumor_size
+}
+
+if (all(c("age_at_diagnosis", "lymph_nodes_examined_positive") %in% colnames(predictors_base))) {
+  predictors_base$age_nodes <- predictors_base$age_at_diagnosis *
+    predictors_base$lymph_nodes_examined_positive
+}
+
+if (all(c("tumor_size", "lymph_nodes_examined_positive") %in% colnames(predictors_base))) {
+  predictors_base$ts_nodes <- predictors_base$tumor_size *
+    predictors_base$lymph_nodes_examined_positive
+}
+
+if (all(c("er_status", "pr_status") %in% colnames(predictors_base))) {
+  predictors_base$ER_PR <- with(predictors_base, er_status:pr_status)
+}
+
+if (all(c("er_status", "her2_status") %in% colnames(predictors_base))) {
+  predictors_base$ER_HER2 <- with(predictors_base, er_status:her2_status)
+}
+```
+
+```{r}
+
+nzv_idx <- nearZeroVar(predictors_base)
+
+if (length(nzv_idx) > 0) {
+  predictors_final <- predictors_base[, -nzv_idx, drop = FALSE]
+} else {
+  predictors_final <- predictors_base
+}
+```
+
+
+# Model Matrix
+```{r}
+X <- model.matrix(~ ., data = predictors_final)[, -1]  
+dim(X)  
+```
+# Class Weights
+```{r}
+w <- ifelse(y == 1,
+            1 / mean(y == 1),
+            1 / mean(y == 0))
+```
+
+#Fit Lasso
+```{r}
+set.seed(123)
+
+cv_lasso <- cv.glmnet(
+  x = X,
+  y = y,
+  family = "binomial",
+  alpha = 1,            
+  nfolds = 10,
+  type.measure = "auc",
+  standardize = FALSE,
+  weights = w
+)
+
+par(mar = c(5, 4, 6, 2))
+plot(cv_lasso)
+title("Enhanced LASSO")
+
+```
+
+```{r}
+prob <- predict(
+  cv_lasso,
+  newx = X,
+  s = "lambda.min",
+  type = "response"
+)
+
+```
+
+#Accuracy, F1, and ROC-AUC
+```{r}
+
+macro_f1_for_thresh <- function(th, prob, y) {
+  pred <- ifelse(prob >= th, 1, 0)
+  pred_fac <- factor(pred, levels = c(0, 1))
+  y_fac    <- factor(y,   levels = c(0, 1))
+  
+  f1_1 <- F_meas(pred_fac, y_fac, relevant = "1")
+  f1_0 <- F_meas(pred_fac, y_fac, relevant = "0")
+  
+  (f1_1 + f1_0) / 2
+}
+
+ths <- seq(0.1, 0.9, by = 0.01)
+f1_vals <- sapply(ths, macro_f1_for_thresh, prob = as.numeric(prob), y = y)
+
+best_idx      <- which.max(f1_vals)
+best_thresh   <- ths[best_idx]
+best_f1_macro <- f1_vals[best_idx]
+
+best_thresh
+best_f1_macro
+```
+
+```{r}
+pred <- ifelse(prob >= best_thresh, 1, 0)
+
+accuracy_lasso <- mean(pred == y)
+
+pred_fac <- factor(pred, levels = c(0, 1))
+y_fac    <- factor(y,   levels = c(0, 1))
+
+f1_1 <- F_meas(pred_fac, y_fac, relevant = "1")
+f1_0 <- F_meas(pred_fac, y_fac, relevant = "0")
+f1_macro_lasso <- (f1_1 + f1_0) / 2
+
+roc_lasso <- roc(y, as.numeric(prob))
+auc_lasso <- auc(roc_lasso)
+
+accuracy_lasso
+f1_macro_lasso
+auc_lasso
+
+plot(
+  roc_lasso,
+  col = "blue",
+  lwd = 2,
+  main = paste0("ROC Curve for Enhanced LASSO (AUC = ",
+                round(auc_lasso, 3), ")")
+)
+```
+
+```{r}
+coef_min <- coef(cv_lasso, s = "lambda.min")
+
+coef_df <- data.frame(
+  feature = rownames(coef_min),
+  coef    = as.numeric(coef_min)
+)
+
+coef_imp <- subset(coef_df, feature != "(Intercept)" & coef != 0)
+coef_imp$abscoef <- abs(coef_imp$coef)
+
+head(coef_imp[order(-coef_imp$abscoef), ], 20)
+```
+
+#Graphs in GGPlot
+```{r}
+library(ggplot2)
+library(dplyr)
+library(pROC)
+library(caret)
+
+############################################################
+# 1 — CV Curve
+############################################################
+
+cv_df <- data.frame(
+  lambda  = cv_lasso$lambda,
+  cvm     = cv_lasso$cvm,
+  cvlo    = cv_lasso$cvlo,
+  cvup    = cv_lasso$cvup
+)
+
+lambda_min <- cv_lasso$lambda.min
+lambda_1se <- cv_lasso$lambda.1se
+
+p_cv <- ggplot(cv_df, aes(x = log(lambda), y = cvm)) +
+  geom_line() +
+  geom_ribbon(aes(ymin = cvlo, ymax = cvup), alpha = 0.2) +
+  geom_vline(xintercept = log(lambda_min), linetype = "dashed", color = "red") +
+  geom_vline(xintercept = log(lambda_1se), linetype = "dotted", color = "blue") +
+  labs(title = "Enhanced LASSO CV Curve", x = "log(lambda)", y = "AUC") +
+  theme_minimal()
+
+png("lasso_cv.png", width = 1600, height = 1200, res = 200)
+print(p_cv)
+dev.off()
+
+
+############################################################
+# 2 — ROC Curve
+############################################################
+
+roc_df <- data.frame(
+  specificity = roc_lasso$specificities,
+  sensitivity = roc_lasso$sensitivities
+) %>% mutate(FPR = 1 - specificity)
+
+p_roc <- ggplot(roc_df, aes(x = FPR, y = sensitivity)) +
+  geom_line(size = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(title = paste0("ROC Curve (AUC = ", round(auc_lasso, 3), ")"),
+       x = "False Positive Rate", y = "True Positive Rate") +
+  theme_minimal()
+
+png("lasso_ROC.png", width = 1600, height = 1200, res = 200)
+print(p_roc)
+dev.off()
+
+
+############################################################
+# 3 — Top 20 Coefficients
+############################################################
+
+coef_df <- data.frame(
+  feature = rownames(coef_min),
+  coef    = as.numeric(coef_min)
+)
+
+coef_imp <- coef_df %>%
+  filter(feature != "(Intercept)", coef != 0) %>%
+  mutate(abscoef = abs(coef)) %>%
+  arrange(desc(abscoef)) %>%
+  slice(1:20)
+
+p_coef <- ggplot(coef_imp, aes(x = reorder(feature, abscoef), y = coef)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Top 20 LASSO Coefficients", x = "Feature", y = "Coefficient") +
+  theme_minimal()
+
+png("lasso_top_coef.png", width = 1800, height = 1400, res = 200)
+print(p_coef)
+dev.off()
+
+
+############################################################
+# 4 — Predicted Probability Histogram
+############################################################
+
+prob_df <- data.frame(
+  prob = as.numeric(prob),
+  outcome = factor(y, levels = c(0, 1),
+                   labels = c("Non-survival", "Survival"))
+)
+
+p_prob <- ggplot(prob_df, aes(x = prob, fill = outcome)) +
+  geom_histogram(bins = 30, alpha = 0.6, position = "identity") +
+  labs(title = "Predicted Survival Probabilities",
+       x = "Predicted Probability", y = "Count") +
+  theme_minimal()
+
+png("lasso_pred_probs.png", width = 1600, height = 1200, res = 200)
+print(p_prob)
+dev.off()
+
+
+############################################################
+# 5 — Confusion Matrix Heatmap
+############################################################
+
+cm <- table(
+  Predicted = factor(pred, labels = c("Non-survival", "Survival")),
+  Actual    = factor(y,    labels = c("Non-survival", "Survival"))
+)
+
+cm_df <- as.data.frame(cm)
+
+p_cm <- ggplot(cm_df, aes(x = Actual, y = Predicted, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), color = "white", size = 5) +
+  scale_fill_gradient(low = "grey50", high = "steelblue") +
+  labs(title = "Confusion Matrix", x = "Actual", y = "Predicted") +
+  theme_minimal()
+
+png("lasso_confusion_matrix.png", width = 1600, height = 1200, res = 200)
+print(p_cm)
+dev.off()
+
+
+############################################################
+# 6 — Calibration Plot
+############################################################
+
+calib_df <- prob_df %>%
+  mutate(bin = cut(prob, breaks = quantile(prob, seq(0, 1, 0.1),
+                                           na.rm = TRUE), include.lowest = TRUE)) %>%
+  group_by(bin) %>%
+  summarise(mean_pred = mean(prob),
+            obs_rate  = mean(outcome == "Survival"))
+
+p_cal <- ggplot(calib_df, aes(x = mean_pred, y = obs_rate)) +
+  geom_point(size = 2) +
+  geom_line() +
+  geom_abline(slope = 1, intercept = 0,
+              color = "red", linetype = "dashed") +
+  labs(title = "Calibration Plot",
+       x = "Mean Predicted Probability",
+       y = "Observed Survival Rate") +
+  theme_minimal()
+
+png("lasso_calibration.png", width = 1600, height = 1200, res = 200)
+print(p_cal)
+dev.off()
+```
+
+#PDP and ICE
+
+
+```{r}
+library(glmnet)
+library(caret)
+library(pdp)
+library(ggplot2)
+library(dplyr)
+
+# Outcome already set earlier:
+# outcome_col <- "overall_survival"
+# metabric[[outcome_col]] <- as.integer(metabric[[outcome_col]])
+# metabric <- metabric[!is.na(metabric[[outcome_col]]), ]
+y <- metabric[["overall_survival"]]
+
+```
+
+```{r}
+simple_vars <- c(
+  "age_at_diagnosis",
+  "tumor_size",
+  "lymph_nodes_examined_positive",
+  "neoplasm_histologic_grade",
+  "mutation_count",
+  "er_status",
+  "pr_status",
+  "her2_status",
+  "integrative_cluster",
+  "pam50_._claudin.low_subtype",
+  "hormone_therapy",
+  "chemotherapy",
+  "radio_therapy"
+)
+
+simple_vars <- intersect(simple_vars, names(metabric))
+
+predictors_simple <- metabric[, simple_vars, drop = FALSE]
+
+```
+
+
+```{r}
+
+char_cols_simple <- sapply(predictors_simple, is.character)
+
+predictors_simple[char_cols_simple] <- lapply(predictors_simple[char_cols_simple], function(x) {
+  x[x == ""] <- NA
+  x
+})
+
+predictors_simple[char_cols_simple] <- lapply(predictors_simple[char_cols_simple], factor)
+
+
+num_cols_simple <- sapply(predictors_simple, is.numeric)
+
+pre_num_simple <- preProcess(
+  predictors_simple[, num_cols_simple, drop = FALSE],
+  method = c("medianImpute")
+)
+
+predictors_num_imp_simple <- predict(pre_num_simple, predictors_simple[, num_cols_simple, drop = FALSE])
+
+predictors_cat_simple <- predictors_simple[, !num_cols_simple, drop = FALSE]
+fac_cols_simple <- sapply(predictors_cat_simple, is.factor)
+
+predictors_cat_simple[fac_cols_simple] <- lapply(predictors_cat_simple[fac_cols_simple], function(x) {
+  x <- addNA(x)
+  lev <- levels(x)
+  lev[is.na(lev)] <- "Missing"
+  levels(x) <- lev
+  x
+})
+
+merge_rare_levels <- function(f, min_count = 10) {
+  tab <- table(f)
+  rare_levels <- names(tab[tab < min_count])
+  if (length(rare_levels) > 0) {
+    f <- factor(ifelse(f %in% rare_levels, "Other", as.character(f)))
+  } else {
+    f <- factor(f)
+  }
+  f
+}
+
+predictors_cat_simple[fac_cols_simple] <- lapply(predictors_cat_simple[fac_cols_simple], merge_rare_levels)
+
+predictors_simple_clean <- cbind(
+  predictors_num_imp_simple,
+  predictors_cat_simple
+)
+
+```
+
+```{r}
+
+X_simple <- model.matrix(~ ., data = predictors_simple_clean)[, -1]
+dim(X_simple)
+
+
+w_simple <- ifelse(y == 1,
+                   1 / mean(y == 1),
+                   1 / mean(y == 0))
+
+set.seed(123)
+
+cv_lasso_simple <- cv.glmnet(
+  x = X_simple,
+  y = y,
+  family = "binomial",
+  alpha = 1,
+  nfolds = 10,
+  type.measure = "auc",
+  standardize = FALSE,
+  weights = w_simple
+)
+
+plot(cv_lasso_simple)
+title("Simple LASSO (Clinical Predictors Only)", line = 2)
+
+prob_simple <- predict(
+  cv_lasso_simple,
+  newx = X_simple,
+  s = "lambda.min",
+  type = "response"
+)
+
+```
+
+```{r}
+
+x_simple_colnames <- colnames(X_simple)
+
+pred_fun_glmnet_simple <- function(object, newdata) {
+  X_new_full <- model.matrix(~ ., data = newdata)[, -1]
+
+  common <- intersect(colnames(X_new_full), x_simple_colnames)
+  
+  X_new <- matrix(0, nrow = nrow(X_new_full), ncol = length(x_simple_colnames))
+  colnames(X_new) <- x_simple_colnames
+  X_new[, common] <- X_new_full[, common]
+  
+  as.numeric(
+    predict(object, newx = X_new, s = "lambda.min", type = "response")
+  )
+}
+
+
+range(pred_fun_glmnet_simple(cv_lasso_simple, predictors_simple_clean))
+
+```
+```{r}
+continuous_vars_simple <- intersect(
+  c("age_at_diagnosis", "tumor_size", "lymph_nodes_examined_positive"),
+  colnames(predictors_simple_clean)
+)
+
+categorical_vars_simple <- intersect(
+  c("er_status", "pr_status", "her2_status",
+    "integrative_cluster", "pam50_._claudin.low_subtype"),
+  colnames(predictors_simple_clean)
+)
+
+continuous_vars_simple
+categorical_vars_simple
+
+```
+```{r}
+for (v in continuous_vars_simple) {
+  pdp_obj <- partial(
+    object    = cv_lasso_simple,
+    pred.var  = v,
+    train     = predictors_simple_clean,
+    pred.fun  = pred_fun_glmnet_simple,
+    grid.resolution = 25,
+    ice       = TRUE
+  )
+  
+  p <- autoplot(
+    pdp_obj,
+    alpha  = 0.15,
+    center = FALSE   
+  ) +
+    labs(
+      title = paste("ICE + PDP (Simple LASSO) for", v),
+      y     = "Predicted P(Survival = 1)",
+      x     = v
+    ) +
+    theme_minimal()
+  
+  png_filename <- paste0("simple_lasso_pdp_ice_", v, ".png")
+  png(png_filename, width = 1600, height = 1200, res = 200)
+  print(p)
+  dev.off()
+}
+
+```
+
+```{r}
+for (v in categorical_vars_simple) {
+  pdp_obj <- partial(
+    object    = cv_lasso_simple,
+    pred.var  = v,
+    train     = predictors_simple_clean,
+    pred.fun  = pred_fun_glmnet_simple,
+    ice       = TRUE
+  )
+  
+  p <- autoplot(
+    pdp_obj,
+    alpha  = 0.3,
+    center = FALSE
+  ) +
+    labs(
+      title = paste("ICE + PDP (Simple LASSO) for", v),
+      y     = "Predicted P(Survival = 1)",
+      x     = v
+    ) +
+    theme_minimal()
+  
+  png_filename <- paste0("simple_lasso_pdp_ice_", v, ".png")
+  png(png_filename, width = 1600, height = 1200, res = 200)
+  print(p)
+  dev.off()
+}
+
+```
+#Using SVM
+```{r}
+library(caret)
+library(pROC)
+library(dplyr)
+
+# y is 0/1; make it a factor for classification
+y_svm <- factor(ifelse(y == 1, "Survival", "NonSurvival"))
+# Make "Survival" the positive class for ROC
+y_svm <- relevel(y_svm, ref = "Survival")
+
+# Combine predictors + outcome (caret likes data frames)
+data_svm <- data.frame(predictors_final, outcome = y_svm)
+
+```
+
+```{r}
+set.seed(123)
+
+ctrl_svm <- trainControl(
+  method = "repeatedcv",
+  number = 5,
+  repeats = 3,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary, 
+  savePredictions = "final"
+)
+
+svm_grid <- expand.grid(
+  C     = 2 ^ c(-1, 0, 1, 2),
+  sigma = 2 ^ c(-5, -4, -3, -2)
+)
+
+```
+
+
+
+```{R}
+install.packages("kernlab")
+library(caret)
+library(pROC)
+library(dplyr)
+
+
+```
+
+```{r}
+y_svm <- factor(ifelse(y == 1, "Survival", "NonSurvival"))
+y_svm <- relevel(y_svm, ref = "Survival")
+
+data_svm <- data.frame(predictors_final, outcome = y_svm)
+
+set.seed(123)
+
+ctrl_svm_lin <- trainControl(
+  method = "cv",
+  number = 3,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+svm_lin_grid <- expand.grid(C = c(0.1, 1, 5))
+
+svm_lin <- train(
+  outcome ~ .,
+  data = data_svm,
+  method = "svmLinear",
+  metric = "ROC",
+  trControl = ctrl_svm_lin,
+  preProcess = c("center", "scale"),
+  tuneGrid = svm_lin_grid
+)
+
+svm_lin
+
+```
+0
+
+```{r}
+# Probabilities for "Survival"
+svm_lin_prob <- predict(svm_lin, newdata = predictors_final, type = "prob")[, "Survival"]
+svm_lin_pred <- predict(svm_lin, newdata = predictors_final, type = "raw")
+
+# Accuracy
+accuracy_svm_lin <- mean(svm_lin_pred == y_svm)
+
+# Macro-F1
+pred_fac <- factor(svm_lin_pred, levels = c("NonSurvival", "Survival"))
+y_fac    <- factor(y_svm,        levels = c("NonSurvival", "Survival"))
+
+f1_surv <- F_meas(pred_fac, y_fac, relevant = "Survival")
+f1_non  <- F_meas(pred_fac, y_fac, relevant = "NonSurvival")
+f1_macro_svm_lin <- (f1_surv + f1_non) / 2
+
+# ROC-AUC
+roc_svm_lin <- roc(
+  response  = y_svm,
+  predictor = as.numeric(svm_lin_prob),
+  levels    = c("NonSurvival", "Survival"),
+  direction = "<"
+)
+auc_svm_lin <- auc(roc_svm_lin)
+
+accuracy_svm_lin
+f1_macro_svm_lin
+auc_svm_lin
+
+```
