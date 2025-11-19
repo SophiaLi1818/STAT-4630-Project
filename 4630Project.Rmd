@@ -1,0 +1,1005 @@
+---
+title: "New"
+output: html_document
+date: "2025-11-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r}
+######################################
+# Setup
+######################################
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(caret)
+library(glmnet)
+library(ranger)
+library(pROC)
+library(Matrix)
+library(xgboost)
+library(corrplot)
+
+set.seed(123)
+```
+
+```{r}
+######################################
+# Load Data & Basic Outcome
+######################################
+metabric <- read.csv("C:/Users/afw3uz/Downloads/metabric.csv",
+                     stringsAsFactors = FALSE)
+
+# Binary outcome: 0 = Deceased, 1 = Alive
+outcome_col <- "overall_survival"
+time_col    <- "overall_survival_months"
+
+metabric[[outcome_col]] <- as.integer(metabric[[outcome_col]])
+
+# Keep only rows with non-missing survival + time
+metabric <- metabric %>%
+  filter(!is.na(.data[[outcome_col]]),
+         !is.na(.data[[time_col]]))
+
+# Outcome vector (0/1)
+y_bin <- metabric[[outcome_col]]
+table(y_bin)
+prop.table(table(y_bin))
+
+# Identify putative gene columns vs clinical columns
+is_gene_col   <- grepl("^[a-z0-9]+$", names(metabric))
+clinical_vars <- names(metabric)[!is_gene_col]
+mutation_vars <- names(metabric)[is_gene_col]
+
+length(clinical_vars)
+length(mutation_vars)
+```
+
+```{r}
+######################################
+# EDA: Class Imbalance
+######################################
+ggplot(metabric, aes(x = factor(.data[[outcome_col]]))) +
+  geom_bar(fill = "#4C72B0") +
+  labs(
+    title = "Class Distribution: Overall Survival",
+    x = "Overall Survival (0 = Deceased, 1 = Alive)",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+######################################
+# EDA: Missingness in Clinical Variables
+######################################
+clinical_predictors <- setdiff(
+  clinical_vars,
+  c("patient_id", outcome_col, time_col, "death_from_cancer", "cancer_type")
+)
+clinical_predictors <- intersect(clinical_predictors, names(metabric))
+
+missing_clin <- sapply(
+  metabric[, clinical_predictors, drop = FALSE],
+  function(x) mean(is.na(x))
+)
+
+missing_clin_df <- data.frame(
+  variable     = names(missing_clin),
+  missing_prop = as.numeric(missing_clin),
+  row.names    = NULL
+)
+
+top_missing <- missing_clin_df %>%
+  arrange(desc(missing_prop)) %>%
+  head(20)
+
+top_missing
+
+ggplot(top_missing, aes(x = reorder(variable, missing_prop),
+                        y = missing_prop)) +
+  geom_col(fill = "#DD8452") +
+  coord_flip() +
+  labs(
+    title = "Top 20 Clinical Variables by Missingness",
+    x = "Variable",
+    y = "Proportion Missing"
+  ) +
+  theme_minimal()
+
+######################################
+# EDA: Mutation Sparsity
+######################################
+mut_mat_full <- as.matrix(metabric[, mutation_vars, drop = FALSE])
+mut_nonzero_prop <- colMeans(mut_mat_full != 0, na.rm = TRUE)
+
+summary(mut_nonzero_prop)
+
+mut_prop_df <- data.frame(
+  nonzero_prop = mut_nonzero_prop
+)
+
+ggplot(mut_prop_df, aes(x = nonzero_prop)) +
+  geom_histogram(bins = 40, fill = "#4C72B0", color = "white") +
+  labs(
+    title = "Non-zero Proportion Across Mutation Features",
+    x = "Proportion of Samples with Non-zero Mutation Indicator",
+    y = "Number of Genes"
+  ) +
+  theme_minimal()
+
+######################################
+# EDA: Correlation Among Numeric Clinical Vars
+######################################
+num_clinical_vars <- clinical_predictors[
+  sapply(metabric[, clinical_predictors, drop = FALSE], is.numeric)
+]
+
+length(num_clinical_vars)
+
+cor_mat <- cor(
+  metabric[, num_clinical_vars, drop = FALSE],
+  use = "pairwise.complete.obs"
+)
+
+corrplot(
+  cor_mat,
+  method = "color",
+  type = "upper",
+  tl.cex = 0.6,
+  tl.col = "black",
+  diag = FALSE
+)
+```
+
+```{r}
+######################################
+# Gene Filtering Based on Sparsity (Guided by EDA)
+######################################
+low_info_thresh <- 0.01
+keep_genes <- names(mut_nonzero_prop[mut_nonzero_prop >= low_info_thresh])
+drop_genes <- setdiff(mutation_vars, keep_genes)
+
+length(mutation_vars)  # original
+length(keep_genes)     # kept
+
+mutation_vars <- keep_genes
+
+######################################
+# Define Predictor Set
+######################################
+exclude_vars <- c(
+  "patient_id",
+  outcome_col,
+  time_col,
+  "death_from_cancer",
+  "cancer_type",
+  drop_genes
+)
+exclude_vars <- intersect(exclude_vars, names(metabric))
+
+predictor_vars <- setdiff(names(metabric), exclude_vars)
+length(predictor_vars)
+```
+
+```{r}
+######################################
+# Train / Test Split (Same for All Models)
+######################################
+set.seed(123)
+train_idx <- createDataPartition(y_bin, p = 0.7, list = FALSE)
+
+train_dat <- metabric[train_idx, ]
+test_dat  <- metabric[-train_idx, ]
+
+y_train_bin <- train_dat[[outcome_col]]
+y_test_bin  <- test_dat[[outcome_col]]
+
+######################################
+# Preprocessing: Factors, Missing Levels, Rare Levels
+######################################
+prep_predictors <- function(df, vars, min_count = 20) {
+  preds <- df[, vars, drop = FALSE]
+  
+  # Characters: "" -> NA, then factor
+  char_cols <- sapply(preds, is.character)
+  preds[char_cols] <- lapply(preds[char_cols], function(x) {
+    x[x == ""] <- NA
+    x
+  })
+  preds[char_cols] <- lapply(preds[char_cols], factor)
+  
+  # Add "Missing" level to all factors
+  make_missing_level <- function(f) {
+    f <- addNA(f)
+    lev <- levels(f)
+    lev[is.na(lev)] <- "Missing"
+    levels(f) <- lev
+    f
+  }
+  fac_cols <- sapply(preds, is.factor)
+  preds[fac_cols] <- lapply(preds[fac_cols], make_missing_level)
+  
+  # Merge rare levels into "Other"
+  merge_rare_levels <- function(f, min_count = 20) {
+    tab <- table(f)
+    rare_levels <- names(tab[tab < min_count])
+    if (length(rare_levels) > 0) {
+      f <- factor(ifelse(f %in% rare_levels, "Other", as.character(f)))
+    } else {
+      f <- factor(f)
+    }
+    f
+  }
+  preds[fac_cols] <- lapply(preds[fac_cols], merge_rare_levels, min_count = min_count)
+  
+  preds
+}
+
+predictors_all <- prep_predictors(metabric, predictor_vars, min_count = 20)
+
+predictors_train <- predictors_all[train_idx, , drop = FALSE]
+predictors_test  <- predictors_all[-train_idx, , drop = FALSE]
+
+######################################
+# Numeric Imputation + Near-Zero Variance Removal
+######################################
+num_cols <- sapply(predictors_train, is.numeric)
+
+pre_num <- preProcess(
+  predictors_train[, num_cols, drop = FALSE],
+  method = c("medianImpute")
+)
+
+num_train_imp <- predict(pre_num, predictors_train[, num_cols, drop = FALSE])
+num_test_imp  <- predict(pre_num, predictors_test[,  num_cols, drop = FALSE])
+
+predictors_train_clean <- data.frame(
+  num_train_imp,
+  predictors_train[, !num_cols, drop = FALSE]
+)
+predictors_test_clean <- data.frame(
+  num_test_imp,
+  predictors_test[, !num_cols, drop = FALSE]
+)
+
+nzv_idx <- nearZeroVar(predictors_train_clean)
+if (length(nzv_idx) > 0) {
+  predictors_train_clean <- predictors_train_clean[, -nzv_idx, drop = FALSE]
+  predictors_test_clean  <- predictors_test_clean[,  -nzv_idx, drop = FALSE]
+}
+dim(predictors_train_clean)
+dim(predictors_test_clean)
+```
+
+```{r}
+######################################
+# PCA on Mutation Gene Block (Only)
+######################################
+gene_cols_in_clean <- intersect(mutation_vars, names(predictors_train_clean))
+
+if (length(gene_cols_in_clean) > 0) {
+  
+  # Keep only numeric gene columns
+  gene_cols_numeric <- gene_cols_in_clean[
+    sapply(predictors_train_clean[, gene_cols_in_clean, drop = FALSE], is.numeric)
+  ]
+  
+  if (length(gene_cols_numeric) > 0) {
+    
+    gene_train_mat <- as.matrix(predictors_train_clean[, gene_cols_numeric, drop = FALSE])
+    gene_test_mat  <- as.matrix(predictors_test_clean[,  gene_cols_numeric, drop = FALSE])
+    
+    # Drop columns with all NA or zero variance in train
+    drop_cols <- apply(gene_train_mat, 2, function(z) {
+      all(is.na(z)) || var(z, na.rm = TRUE) == 0
+    })
+    
+    if (any(drop_cols)) {
+      gene_train_mat <- gene_train_mat[, !drop_cols, drop = FALSE]
+      gene_test_mat  <- gene_test_mat[, !drop_cols, drop = FALSE]
+      gene_cols_final <- gene_cols_numeric[!drop_cols]
+    } else {
+      gene_cols_final <- gene_cols_numeric
+    }
+    
+    if (length(gene_cols_final) == 0) {
+      predictors_train_pca <- predictors_train_clean
+      predictors_test_pca  <- predictors_test_clean
+    } else {
+      # Replace NAs with 0 before PCA
+      gene_train_mat[is.na(gene_train_mat)] <- 0
+      gene_test_mat[is.na(gene_test_mat)]  <- 0
+      
+      pca_genes <- prcomp(gene_train_mat, center = TRUE, scale. = TRUE)
+      
+      # Choose K PCs: min # to explain >= 80% variance, capped at 20
+      pca_sum <- summary(pca_genes)
+      cumvar  <- pca_sum$importance["Cumulative Proportion", ]
+      K_80    <- which(cumvar >= 0.80)[1]
+      if (is.na(K_80)) K_80 <- ncol(pca_genes$x)
+      K <- min(K_80, 20, ncol(pca_genes$x))
+      
+      pc_train <- as.data.frame(pca_genes$x[, 1:K, drop = FALSE])
+      
+      pc_test <- as.data.frame(
+        scale(
+          gene_test_mat,
+          center = pca_genes$center,
+          scale  = pca_genes$scale
+        ) %*% pca_genes$rotation[, 1:K, drop = FALSE]
+      )
+      
+      colnames(pc_train) <- paste0("PC_gene_", seq_len(K))
+      colnames(pc_test)  <- paste0("PC_gene_", seq_len(K))
+      
+      # Remove original gene columns and add PCs
+      predictors_train_pca <- predictors_train_clean %>%
+        dplyr::select(-all_of(gene_cols_final)) %>%
+        dplyr::bind_cols(pc_train)
+      
+      predictors_test_pca <- predictors_test_clean %>%
+        dplyr::select(-all_of(gene_cols_final)) %>%
+        dplyr::bind_cols(pc_test)
+    }
+    
+  } else {
+    # No numeric gene columns
+    predictors_train_pca <- predictors_train_clean
+    predictors_test_pca  <- predictors_test_clean
+  }
+  
+} else {
+  # No mutation gene columns found
+  predictors_train_pca <- predictors_train_clean
+  predictors_test_pca  <- predictors_test_clean
+}
+
+dim(predictors_train_pca)
+dim(predictors_test_pca)
+```
+
+```{r}
+######################################
+# Clinically Motivated Interactions
+######################################
+make_interactions <- function(df, vars, prefix = "int_") {
+  out <- df
+  if (length(vars) >= 2) {
+    combs <- t(combn(vars, 2))
+    for (i in seq_len(nrow(combs))) {
+      v1 <- combs[i, 1]
+      v2 <- combs[i, 2]
+      inter_name <- paste0(prefix, v1, "_x_", v2)
+      out[[inter_name]] <- df[[v1]] * df[[v2]]
+    }
+  }
+  out
+}
+
+clin_interact_vars <- intersect(
+  c("age_at_diagnosis", "tumor_size", "lymph_nodes_examined_positive"),
+  names(predictors_train_pca)
+)
+
+clin_interact_vars
+
+predictors_train_final <- make_interactions(predictors_train_pca, clin_interact_vars)
+predictors_test_final  <- make_interactions(predictors_test_pca,  clin_interact_vars)
+
+dim(predictors_train_final)
+dim(predictors_test_final)
+```
+
+```{r}
+######################################
+# Model Matrix (for LASSO & XGBoost)
+######################################
+pred_all_final <- rbind(predictors_train_final, predictors_test_final)
+mm_formula <- ~ . - 1
+X_all <- model.matrix(mm_formula, data = pred_all_final)
+
+n_train <- nrow(predictors_train_final)
+X_train <- X_all[1:n_train, , drop = FALSE]
+X_test  <- X_all[(n_train + 1):nrow(X_all), , drop = FALSE]
+
+X_train_sp <- as(X_train, "dgCMatrix")
+X_test_sp  <- as(X_test,  "dgCMatrix")
+
+# Numeric outcomes 0/1 for models that need them
+y_train_num <- y_train_bin
+y_test_num  <- y_test_bin
+
+######################################
+# Helpers: Factors, Macro-F1, TrainControl
+######################################
+y_train_fac <- factor(ifelse(y_train_bin == 1, "Yes", "No"),
+                      levels = c("No", "Yes"))
+y_test_fac  <- factor(ifelse(y_test_bin  == 1, "Yes", "No"),
+                      levels = c("No", "Yes"))
+
+macro_f1 <- function(pred, y_true) {
+  pred_fac <- factor(pred, levels = c(0, 1))
+  y_fac    <- factor(y_true, levels = c(0, 1))
+  
+  f1_pos <- F_meas(pred_fac, y_fac, relevant = "1")
+  f1_neg <- F_meas(pred_fac, y_fac, relevant = "0")
+  
+  (f1_pos + f1_neg) / 2
+}
+
+# 5-fold, 2-times repeated CV for LASSO (AUC metric)
+ctrl <- trainControl(
+  method = "repeatedcv",
+  number = 5,
+  repeats = 2,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,  # AUC
+  savePredictions = "final",
+  verboseIter = FALSE
+)
+```
+
+```{r}
+######################################
+# LASSO (glmnet)
+######################################
+X_train_mat <- as.matrix(X_train)
+X_test_mat  <- as.matrix(X_test)
+
+lasso_grid <- expand.grid(
+  alpha  = 1,
+  lambda = exp(seq(log(1e-4), log(1), length.out = 25))
+)
+
+set.seed(123)
+lasso_fit <- train(
+  x = X_train_mat,
+  y = y_train_fac,
+  method = "glmnet",
+  trControl = ctrl,
+  metric = "ROC",
+  tuneGrid = lasso_grid
+)
+
+prob_lasso_test <- predict(lasso_fit, newdata = X_test_mat, type = "prob")[, "Yes"]
+pred_lasso_test <- ifelse(prob_lasso_test >= 0.5, 1, 0)
+
+acc_lasso_test <- mean(pred_lasso_test == y_test_bin)
+roc_lasso      <- roc(y_test_bin, prob_lasso_test)
+auc_lasso_test <- auc(roc_lasso)
+f1_macro_lasso <- macro_f1(pred_lasso_test, y_test_bin)
+
+best_lambda <- lasso_fit$bestTune$lambda
+coef_mat <- coef(lasso_fit$finalModel, s = best_lambda)
+
+lasso_coef_df <- data.frame(
+  feature = rownames(coef_mat),
+  coef    = as.numeric(coef_mat),
+  row.names = NULL
+) %>%
+  filter(feature != "(Intercept)", coef != 0)
+
+lasso_coef_df$abscoef <- abs(lasso_coef_df$coef)
+
+top10_lasso <- lasso_coef_df %>%
+  arrange(desc(abscoef)) %>%
+  head(10)
+
+acc_lasso_test
+auc_lasso_test
+f1_macro_lasso
+top10_lasso
+```
+
+```{r}
+######################################
+# Random Forest (ranger) with 5x2 CV on AUC
+######################################
+set.seed(123)
+
+rf_data <- data.frame(predictors_train_final, y = y_train_fac)
+n_train <- nrow(rf_data)
+
+folds_list <- list()
+fold_id <- 1
+
+for (rep in 1:2) {
+  this_folds <- createFolds(rf_data$y, k = 5, list = TRUE, returnTrain = FALSE)
+  for (k in 1:5) {
+    folds_list[[fold_id]] <- this_folds[[k]]
+    fold_id <- fold_id + 1
+  }
+}
+
+length(folds_list)  # 10 folds total (5x2)
+
+p_rf <- ncol(predictors_train_final)
+
+rf_grid <- expand.grid(
+  mtry          = floor(c(sqrt(p_rf), p_rf / 4)),
+  min.node.size = c(5, 10)
+)
+
+rf_grid
+
+cv_results <- data.frame(
+  mtry          = rf_grid$mtry,
+  min.node.size = rf_grid$min.node.size,
+  mean_auc      = NA_real_
+)
+
+for (g in seq_len(nrow(rf_grid))) {
+  mtry_g     <- rf_grid$mtry[g]
+  min_node_g <- rf_grid$min.node.size[g]
+  
+  auc_vec <- numeric(length(folds_list))
+  
+  for (i in seq_along(folds_list)) {
+    val_idx   <- folds_list[[i]]
+    train_idx <- setdiff(seq_len(n_train), val_idx)
+    
+    train_dat <- rf_data[train_idx, , drop = FALSE]
+    val_dat   <- rf_data[val_idx,   , drop = FALSE]
+    
+    fit_g <- ranger(
+      y ~ .,
+      data          = train_dat,
+      num.trees     = 150,
+      mtry          = mtry_g,
+      min.node.size = min_node_g,
+      importance    = "impurity",
+      probability   = TRUE
+    )
+    
+    prob_val <- predict(fit_g, data = val_dat)$predictions[, "Yes"]
+    true_val <- ifelse(val_dat$y == "Yes", 1, 0)
+    
+    auc_vec[i] <- as.numeric(auc(roc(true_val, prob_val)))
+  }
+  
+  cv_results$mean_auc[g] <- mean(auc_vec, na.rm = TRUE)
+}
+
+cv_results
+
+best_idx    <- which.max(cv_results$mean_auc)
+best_params <- cv_results[best_idx, ]
+best_params
+
+best_mtry     <- best_params$mtry
+best_min_node <- best_params$min.node.size
+
+set.seed(123)
+rf_final <- ranger(
+  y ~ .,
+  data          = rf_data,
+  num.trees     = 200,
+  mtry          = best_mtry,
+  min.node.size = best_min_node,
+  importance    = "impurity",
+  probability   = TRUE
+)
+
+rf_test_dat <- data.frame(predictors_test_final)
+
+rf_test_pred <- predict(rf_final, data = rf_test_dat)
+rf_prob_test <- rf_test_pred$predictions[, "Yes"]
+
+rf_pred_test <- ifelse(rf_prob_test >= 0.5, 1, 0)
+
+acc_rf_test <- mean(rf_pred_test == y_test_bin)
+roc_rf      <- roc(y_test_bin, rf_prob_test)
+auc_rf_test <- auc(roc_rf)
+f1_macro_rf <- macro_f1(rf_pred_test, y_test_bin)
+
+acc_rf_test
+auc_rf_test
+f1_macro_rf
+
+imp_vec <- rf_final$variable.importance
+imp_df <- data.frame(
+  feature    = names(imp_vec),
+  importance = as.numeric(imp_vec),
+  row.names  = NULL
+)
+
+top10_rf <- imp_df %>%
+  arrange(desc(importance)) %>%
+  head(10)
+
+top10_rf
+```
+
+```{r}
+######################################
+# XGBoost with 5x2 CV on AUC
+######################################
+set.seed(123)
+
+folds_xgb <- list()
+fold_id <- 1
+
+for (rep in 1:2) {
+  this_folds <- createFolds(y_train_bin, k = 5, list = TRUE, returnTrain = FALSE)
+  for (k in 1:5) {
+    folds_xgb[[fold_id]] <- this_folds[[k]]
+    fold_id <- fold_id + 1
+  }
+}
+
+length(folds_xgb)  # 10 folds (5x2)
+
+xgb_grid <- expand.grid(
+  max_depth = c(3, 4),
+  eta       = c(0.05, 0.10)
+)
+
+cv_xgb_results <- data.frame(
+  max_depth = xgb_grid$max_depth,
+  eta       = xgb_grid$eta,
+  mean_auc  = NA_real_
+)
+
+for (g in seq_len(nrow(xgb_grid))) {
+  md <- xgb_grid$max_depth[g]
+  lr <- xgb_grid$eta[g]
+  
+  auc_vec <- numeric(length(folds_xgb))
+  
+  for (i in seq_along(folds_xgb)) {
+    val_idx   <- folds_xgb[[i]]
+    train_idx <- setdiff(seq_len(length(y_train_num)), val_idx)
+    
+    dtrain <- xgb.DMatrix(
+      data  = X_train_sp[train_idx, , drop = FALSE],
+      label = y_train_num[train_idx]
+    )
+    dval   <- xgb.DMatrix(
+      data  = X_train_sp[val_idx, , drop = FALSE],
+      label = y_train_num[val_idx]
+    )
+    
+    params <- list(
+      objective        = "binary:logistic",
+      eval_metric      = "auc",
+      max_depth        = md,
+      eta              = lr,
+      subsample        = 0.8,
+      colsample_bytree = 0.7,
+      gamma            = 0,
+      min_child_weight = 1
+    )
+    
+    xgb_cv_fit <- xgb.train(
+      params  = params,
+      data    = dtrain,
+      nrounds = 100,
+      verbose = 0
+    )
+    
+    prob_val <- predict(xgb_cv_fit, dval)
+    auc_vec[i] <- as.numeric(auc(roc(y_train_num[val_idx], prob_val)))
+  }
+  
+  cv_xgb_results$mean_auc[g] <- mean(auc_vec, na.rm = TRUE)
+}
+
+cv_xgb_results
+
+best_xgb_idx    <- which.max(cv_xgb_results$mean_auc)
+best_xgb_params <- cv_xgb_results[best_xgb_idx, ]
+best_xgb_params
+
+dtrain_full <- xgb.DMatrix(
+  data  = X_train_sp,
+  label = y_train_num
+)
+
+params_best <- list(
+  objective        = "binary:logistic",
+  eval_metric      = "auc",
+  max_depth        = best_xgb_params$max_depth,
+  eta              = best_xgb_params$eta,
+  subsample        = 0.8,
+  colsample_bytree = 0.7,
+  gamma            = 0,
+  min_child_weight = 1
+)
+
+set.seed(123)
+xgb_final <- xgb.train(
+  params  = params_best,
+  data    = dtrain_full,
+  nrounds = 100,
+  verbose = 0
+)
+
+dtest <- xgb.DMatrix(
+  data  = X_test_sp,
+  label = y_test_num
+)
+
+prob_xgb_test <- predict(xgb_final, dtest)
+pred_xgb_test <- ifelse(prob_xgb_test >= 0.5, 1, 0)
+
+acc_xgb_test <- mean(pred_xgb_test == y_test_num)
+roc_xgb      <- roc(y_test_num, prob_xgb_test)
+auc_xgb_test <- auc(roc_xgb)
+f1_macro_xgb <- macro_f1(pred_xgb_test, y_test_num)
+
+acc_xgb_test
+auc_xgb_test
+f1_macro_xgb
+
+imp_xgb <- xgb.importance(
+  model         = xgb_final,
+  feature_names = colnames(X_train_sp)
+)
+
+top10_xgb <- head(imp_xgb, 10)
+top10_xgb
+```
+
+```{r}
+######################################
+# Final Model Comparison Table
+######################################
+model_summary <- data.frame(
+  Model = c("LASSO", "Random Forest", "XGBoost"),
+  Accuracy = c(acc_lasso_test, acc_rf_test, acc_xgb_test),
+  AUC      = c(as.numeric(auc_lasso_test),
+               as.numeric(auc_rf_test),
+               as.numeric(auc_xgb_test)),
+  F1c_Macro = c(f1_macro_lasso, f1_macro_rf, f1_macro_xgb)
+)
+
+model_summary_pretty <- model_summary %>%
+  mutate(
+    Accuracy  = round(Accuracy,  4),
+    AUC       = round(AUC,       4),
+    F1c_Macro = round(F1c_Macro, 4)
+  )
+
+model_summary_pretty
+
+```
+
+
+```{r}
+library(dplyr)
+glimpse(metabric)
+```
+
+```{r}
+# PDP
+pdp_vars <- c(
+  "age_at_diagnosis",
+  "tumor_size",
+  "lymph_nodes_examined_positive",
+  "nottingham_prognostic_index"
+)
+
+
+```
+
+```{r}
+######################################
+# PDP / ICE – Helper Predict Functions
+######################################
+
+# Predict probabilities with LASSO (caret glmnet model)
+predict_lasso_prob <- function(newdat) {
+  # Build model matrix in the same way as training
+  X_new <- model.matrix(mm_formula, data = newdat)
+  
+  # Ensure same columns as X_train (add missing as 0, reorder)
+  missing_cols <- setdiff(colnames(X_train), colnames(X_new))
+  if (length(missing_cols) > 0) {
+    add_mat <- matrix(0, nrow = nrow(X_new), ncol = length(missing_cols))
+    colnames(add_mat) <- missing_cols
+    X_new <- cbind(X_new, add_mat)
+  }
+  X_new <- X_new[, colnames(X_train), drop = FALSE]
+  
+  prob <- predict(lasso_fit, newdata = as.matrix(X_new), type = "prob")[, "Yes"]
+  prob
+}
+
+# Predict probabilities with Random Forest
+predict_rf_prob <- function(newdat) {
+  # Ensure same columns as used in rf_data
+  newdat2 <- newdat[, names(predictors_train_final), drop = FALSE]
+  pred_rf <- predict(rf_final, data = newdat2)
+  pred_rf$predictions[, "Yes"]
+}
+
+# Predict probabilities with XGBoost
+predict_xgb_prob <- function(newdat) {
+  X_new <- model.matrix(mm_formula, data = newdat)
+  
+  # Align columns with X_train
+  missing_cols <- setdiff(colnames(X_train), colnames(X_new))
+  if (length(missing_cols) > 0) {
+    add_mat <- matrix(0, nrow = nrow(X_new), ncol = length(missing_cols))
+    colnames(add_mat) <- missing_cols
+    X_new <- cbind(X_new, add_mat)
+  }
+  X_new <- X_new[, colnames(X_train), drop = FALSE]
+  
+  X_new_sp <- as(X_new, "dgCMatrix")
+  dnew <- xgb.DMatrix(data = X_new_sp)
+  predict(xgb_final, dnew)
+}
+
+```
+
+```{r}
+######################################
+# PDP / ICE – Computation for One Feature
+######################################
+
+pdp_ice_for_feature <- function(feature, grid_points = 20, n_ice = 50) {
+  if (!feature %in% names(predictors_train_final)) {
+    stop(paste("Feature", feature, "not found in predictors_train_final"))
+  }
+  
+  x <- predictors_train_final[[feature]]
+  if (!is.numeric(x)) {
+    stop("This helper currently supports only numeric features.")
+  }
+  
+  grid_vals <- seq(min(x, na.rm = TRUE),
+                   max(x, na.rm = TRUE),
+                   length.out = grid_points)
+  
+  # subset of rows for ICE curves
+  set.seed(123)
+  ice_idx <- sample(seq_len(nrow(predictors_train_final)),
+                    size = min(n_ice, nrow(predictors_train_final)))
+  
+  base_dat <- predictors_train_final
+  ice_dat  <- predictors_train_final[ice_idx, , drop = FALSE]
+  
+  pdp_list <- list()
+  ice_list <- list()
+  
+  for (g in seq_along(grid_vals)) {
+    v <- grid_vals[g]
+    
+    ## PDP: overwrite feature in full training data
+    newdat <- base_dat
+    newdat[[feature]] <- v
+    
+    prob_lasso <- predict_lasso_prob(newdat)
+    prob_rf    <- predict_rf_prob(newdat)
+    prob_xgb   <- predict_xgb_prob(newdat)
+    
+    pdp_list[[g]] <- data.frame(
+      feature = feature,
+      value   = v,
+      model   = c("LASSO", "Random Forest", "XGBoost"),
+      pdp     = c(mean(prob_lasso),
+                  mean(prob_rf),
+                  mean(prob_xgb))
+    )
+    
+    ## ICE: overwrite feature only in subset (ice_dat)
+    new_ice <- ice_dat
+    new_ice[[feature]] <- v
+    
+    prob_lasso_i <- predict_lasso_prob(new_ice)
+    prob_rf_i    <- predict_rf_prob(new_ice)
+    prob_xgb_i   <- predict_xgb_prob(new_ice)
+    
+    ice_list[[g]] <- rbind(
+      data.frame(id = ice_idx,
+                 feature = feature,
+                 value   = v,
+                 model   = "LASSO",
+                 prob    = prob_lasso_i),
+      data.frame(id = ice_idx,
+                 feature = feature,
+                 value   = v,
+                 model   = "Random Forest",
+                 prob    = prob_rf_i),
+      data.frame(id = ice_idx,
+                 feature = feature,
+                 value   = v,
+                 model   = "XGBoost",
+                 prob    = prob_xgb_i)
+    )
+  }
+  
+  pdp_df <- do.call(rbind, pdp_list)
+  ice_df <- do.call(rbind, ice_list)
+  list(pdp = pdp_df, ice = ice_df)
+}
+
+```
+
+```{r}
+######################################
+# Run PDP / ICE for Selected Features
+######################################
+
+pdp_vars <- c("age_at_diagnosis",
+              "tumor_size",
+              "lymph_nodes_examined_positive",
+              "nottingham_prognostic_index")
+
+pdp_ice_results <- lapply(pdp_vars, pdp_ice_for_feature,
+                          grid_points = 20, n_ice = 50)
+names(pdp_ice_results) <- pdp_vars
+
+```
+
+```{r}
+######################################
+# Plotting PDP + ICE for One Feature
+######################################
+
+library(ggplot2)
+
+plot_pdp_ice <- function(res, feature_label = NULL) {
+  pdp_df <- res$pdp
+  ice_df <- res$ice
+  
+  if (is.null(feature_label)) {
+    feature_label <- unique(pdp_df$feature)
+  }
+  
+  ggplot() +
+    # ICE: individual conditional expectation
+    geom_line(
+      data = ice_df,
+      aes(x = value, y = prob,
+          group = interaction(id, model)),
+      alpha = 0.15,
+      color = "grey70"
+    ) +
+    # PDP: partial dependence (average)
+    geom_line(
+      data = pdp_df,
+      aes(x = value, y = pdp, color = model),
+      size = 1.1
+    ) +
+    facet_wrap(~ model, scales = "free_y") +
+    labs(
+      title = paste("PDP and ICE for", feature_label),
+      x = feature_label,
+      y = "Predicted P(Y = 1 | X)"
+    ) +
+    theme_minimal()
+}
+
+```
+
+```{r}
+######################################
+# Example Plots
+######################################
+
+# Age at diagnosis
+plot_pdp_ice(pdp_ice_results[["age_at_diagnosis"]],
+             feature_label = "Age at diagnosis")
+
+# Tumor size
+plot_pdp_ice(pdp_ice_results[["tumor_size"]],
+             feature_label = "Tumor size (mm)")
+
+# Lymph nodes examined positive
+plot_pdp_ice(pdp_ice_results[["lymph_nodes_examined_positive"]],
+             feature_label = "Positive lymph nodes")
+
+# Nottingham Index
+plot_pdp_ice(pdp_ice_results[["nottingham_prognostic_index"]],
+             feature_label = "Nottingham Prognostic Index")
+```
