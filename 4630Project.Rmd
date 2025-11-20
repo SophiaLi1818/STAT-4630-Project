@@ -1,0 +1,1189 @@
+---
+title: "STAT 4630 Project"
+output: html_document
+date: "2025-11-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r}
+# Setup by downloading all needed packages
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(caret)
+library(glmnet)
+library(ranger)
+library(pROC)
+library(Matrix)
+library(xgboost)
+library(corrplot)
+
+set.seed(123)
+```
+### EDA and Processing ###
+```{r}
+# Loading data and calculating basic outcomes
+metabric <- read.csv("C:/Users/afw3uz/Downloads/metabric.csv",
+                     stringsAsFactors = FALSE)
+
+# Binary outcome: 0 = Deceased, 1 = Alive
+outcome_col <- "overall_survival"
+time_col    <- "overall_survival_months"
+
+metabric[[outcome_col]] <- as.integer(metabric[[outcome_col]])
+
+# Keep only rows with non-missing survival + time
+metabric <- metabric %>%
+  filter(!is.na(.data[[outcome_col]]),
+         !is.na(.data[[time_col]]))
+
+# Outcome vector (0/1)
+y_bin <- metabric[[outcome_col]]
+table(y_bin)
+prop.table(table(y_bin))
+
+# Identify putative gene columns vs clinical columns
+is_gene_col   <- grepl("^[a-z0-9]+$", names(metabric))
+clinical_vars <- names(metabric)[!is_gene_col]
+mutation_vars <- names(metabric)[is_gene_col]
+
+length(clinical_vars)
+length(mutation_vars)
+```
+
+```{r}
+# EDA with class imbalance
+ggplot(metabric, aes(x = factor(.data[[outcome_col]]))) +
+  geom_bar(fill = "#4C72B0") +
+  labs(
+    title = "Class Distribution: Overall Survival",
+    x = "Overall Survival (0 = Deceased, 1 = Alive)",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+# EDA with clinical variables and identifying missingness
+clinical_predictors <- setdiff(
+  clinical_vars,
+  c("patient_id", outcome_col, time_col, "death_from_cancer", "cancer_type")
+)
+clinical_predictors <- intersect(clinical_predictors, names(metabric))
+
+missing_clin <- sapply(
+  metabric[, clinical_predictors, drop = FALSE],
+  function(x) mean(is.na(x))
+)
+
+missing_clin_df <- data.frame(
+  variable     = names(missing_clin),
+  missing_prop = as.numeric(missing_clin),
+  row.names    = NULL
+)
+
+top_missing <- missing_clin_df %>%
+  arrange(desc(missing_prop)) %>%
+  head(20)
+
+top_missing
+
+ggplot(top_missing, aes(x = reorder(variable, missing_prop),
+                        y = missing_prop)) +
+  geom_col(fill = "#DD8452") +
+  coord_flip() +
+  labs(
+    title = "Top 20 Clinical Variables by Missingness",
+    x = "Variable",
+    y = "Proportion Missing"
+  ) +
+  theme_minimal()
+
+# EDA with mutation sparsity
+mut_mat_full <- as.matrix(metabric[, mutation_vars, drop = FALSE])
+mut_nonzero_prop <- colMeans(mut_mat_full != 0, na.rm = TRUE)
+
+summary(mut_nonzero_prop)
+
+mut_prop_df <- data.frame(
+  nonzero_prop = mut_nonzero_prop
+)
+
+ggplot(mut_prop_df, aes(x = nonzero_prop)) +
+  geom_histogram(bins = 40, fill = "#4C72B0", color = "white") +
+  labs(
+    title = "Non-zero Proportion Across Mutation Features",
+    x = "Proportion of Samples with Non-zero Mutation Indicator",
+    y = "Number of Genes"
+  ) +
+  theme_minimal()
+
+# EDA with correlation among numerical clinical variables
+num_clinical_vars <- clinical_predictors[
+  sapply(metabric[, clinical_predictors, drop = FALSE], is.numeric)
+]
+
+length(num_clinical_vars)
+
+cor_mat <- cor(
+  metabric[, num_clinical_vars, drop = FALSE],
+  use = "pairwise.complete.obs"
+)
+
+corrplot(
+  cor_mat,
+  method = "color",
+  type = "upper",
+  tl.cex = 0.6,
+  tl.col = "black",
+  diag = FALSE
+)
+```
+
+```{r}
+# EDA with Mutation Burden
+metabric$mutation_count_raw <- rowSums(mut_mat_full != 0, na.rm = TRUE)
+
+ggplot(metabric, aes(x = mutation_count_raw)) +
+  geom_histogram(bins = 35, fill = "#4C72B0", color = "white") +
+  labs(
+    title = "Distribution of Mutation Burden per Patient",
+    x = "Number of Mutated Genes",
+    y = "Number of Patients"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# EDA with Outcome vs. Key Clinical Predictors (Boxplots)
+# Key clinical variables for bivariate EDA
+key_vars <- c(
+  "age_at_diagnosis",
+  "tumor_size",
+  "tumor_stage",
+  "nottingham_prognostic_index",
+  "lymph_nodes_examined_positive"
+)
+
+# Pivot longer for faceted boxplots
+metabric_long <- metabric %>%
+  select(all_of(key_vars), overall_survival = !!sym(outcome_col)) %>%
+  tidyr::pivot_longer(
+    cols = -overall_survival,
+    names_to = "variable",
+    values_to = "value"
+  )
+
+# Boxplot comparison of survival groups
+ggplot(metabric_long, aes(x = factor(overall_survival), y = value)) +
+  geom_boxplot(fill = "#4C72B0") +
+  facet_wrap(~ variable, scales = "free_y") +
+  labs(
+    title = "Distributions of Key Clinical Variables by Survival Outcome",
+    x = "Overall Survival (0 = Deceased, 1 = Alive)",
+    y = "Value"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+# EDA with Density Plots
+ggplot(metabric_long, aes(x = value, fill = factor(overall_survival))) +
+  geom_density(alpha = 0.4) +
+  facet_wrap(~ variable, scales = "free") +
+  scale_fill_manual(values = c("#DD8452", "#4C72B0")) +
+  labs(
+    title = "Density Plots by Survival Outcome",
+    x = "Value",
+    fill = "Outcome"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+
+# EDA with Stacked Chart
+cat_var <- "tumor_stage"   
+
+ggplot(metabric, aes(x = .data[[cat_var]], fill = factor(.data[[outcome_col]]))) +
+  geom_bar(position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_manual(values = c("#DD8452", "#4C72B0")) +
+  labs(
+    title = paste("Survival Proportion by", cat_var),
+    x = cat_var, y = "Proportion Alive"
+  ) +
+  theme_minimal()
+
+
+```
+
+
+```{r}
+# Gene filtering based on sparsity and EDA
+low_info_thresh <- 0.01
+keep_genes <- names(mut_nonzero_prop[mut_nonzero_prop >= low_info_thresh])
+drop_genes <- setdiff(mutation_vars, keep_genes)
+
+length(mutation_vars)  # original
+length(keep_genes)     # kept
+
+mutation_vars <- keep_genes
+
+# Defining the predictor set
+exclude_vars <- c(
+  "patient_id",
+  outcome_col,
+  time_col,
+  "death_from_cancer",
+  "cancer_type",
+  drop_genes
+)
+exclude_vars <- intersect(exclude_vars, names(metabric))
+
+predictor_vars <- setdiff(names(metabric), exclude_vars)
+length(predictor_vars)
+```
+
+```{r}
+
+# 70-30 train/test split
+set.seed(123)
+train_idx <- createDataPartition(y_bin, p = 0.7, list = FALSE)
+
+train_dat <- metabric[train_idx, ]
+test_dat  <- metabric[-train_idx, ]
+
+y_train_bin <- train_dat[[outcome_col]]
+y_test_bin  <- test_dat[[outcome_col]]
+
+
+# Preprocessing: Factors, Missing Levels, Rare Levels
+
+prep_predictors <- function(df, vars, min_count = 20) {
+  preds <- df[, vars, drop = FALSE]
+  
+  # Characters: "" -> NA, then factor
+  char_cols <- sapply(preds, is.character)
+  preds[char_cols] <- lapply(preds[char_cols], function(x) {
+    x[x == ""] <- NA
+    x
+  })
+  preds[char_cols] <- lapply(preds[char_cols], factor)
+  
+  # Add "Missing" level to all factors
+  make_missing_level <- function(f) {
+    f <- addNA(f)
+    lev <- levels(f)
+    lev[is.na(lev)] <- "Missing"
+    levels(f) <- lev
+    f
+  }
+  fac_cols <- sapply(preds, is.factor)
+  preds[fac_cols] <- lapply(preds[fac_cols], make_missing_level)
+  
+  # Merge rare levels into "Other"
+  merge_rare_levels <- function(f, min_count = 20) {
+    tab <- table(f)
+    rare_levels <- names(tab[tab < min_count])
+    if (length(rare_levels) > 0) {
+      f <- factor(ifelse(f %in% rare_levels, "Other", as.character(f)))
+    } else {
+      f <- factor(f)
+    }
+    f
+  }
+  preds[fac_cols] <- lapply(preds[fac_cols], merge_rare_levels, min_count = min_count)
+  
+  preds
+}
+
+predictors_all <- prep_predictors(metabric, predictor_vars, min_count = 20)
+
+predictors_train <- predictors_all[train_idx, , drop = FALSE]
+predictors_test  <- predictors_all[-train_idx, , drop = FALSE]
+
+
+# Numeric Imputation + Near-Zero Variance Removal
+
+num_cols <- sapply(predictors_train, is.numeric)
+
+pre_num <- preProcess(
+  predictors_train[, num_cols, drop = FALSE],
+  method = c("medianImpute")
+)
+
+num_train_imp <- predict(pre_num, predictors_train[, num_cols, drop = FALSE])
+num_test_imp  <- predict(pre_num, predictors_test[,  num_cols, drop = FALSE])
+
+predictors_train_clean <- data.frame(
+  num_train_imp,
+  predictors_train[, !num_cols, drop = FALSE]
+)
+predictors_test_clean <- data.frame(
+  num_test_imp,
+  predictors_test[, !num_cols, drop = FALSE]
+)
+
+nzv_idx <- nearZeroVar(predictors_train_clean)
+if (length(nzv_idx) > 0) {
+  predictors_train_clean <- predictors_train_clean[, -nzv_idx, drop = FALSE]
+  predictors_test_clean  <- predictors_test_clean[,  -nzv_idx, drop = FALSE]
+}
+dim(predictors_train_clean)
+dim(predictors_test_clean)
+```
+
+```{r}
+# PCA on mutation gene block only
+gene_cols_in_clean <- intersect(mutation_vars, names(predictors_train_clean))
+
+if (length(gene_cols_in_clean) > 0) {
+  
+  # Keep only numeric gene columns
+  gene_cols_numeric <- gene_cols_in_clean[
+    sapply(predictors_train_clean[, gene_cols_in_clean, drop = FALSE], is.numeric)
+  ]
+  
+  if (length(gene_cols_numeric) > 0) {
+    
+    gene_train_mat <- as.matrix(predictors_train_clean[, gene_cols_numeric, drop = FALSE])
+    gene_test_mat  <- as.matrix(predictors_test_clean[,  gene_cols_numeric, drop = FALSE])
+    
+    # Drop columns with all NA or zero variance in train
+    drop_cols <- apply(gene_train_mat, 2, function(z) {
+      all(is.na(z)) || var(z, na.rm = TRUE) == 0
+    })
+    
+    if (any(drop_cols)) {
+      gene_train_mat <- gene_train_mat[, !drop_cols, drop = FALSE]
+      gene_test_mat  <- gene_test_mat[, !drop_cols, drop = FALSE]
+      gene_cols_final <- gene_cols_numeric[!drop_cols]
+    } else {
+      gene_cols_final <- gene_cols_numeric
+    }
+    
+    if (length(gene_cols_final) == 0) {
+      predictors_train_pca <- predictors_train_clean
+      predictors_test_pca  <- predictors_test_clean
+    } else {
+      # Replace NAs with 0 before PCA
+      gene_train_mat[is.na(gene_train_mat)] <- 0
+      gene_test_mat[is.na(gene_test_mat)]  <- 0
+      
+      pca_genes <- prcomp(gene_train_mat, center = TRUE, scale. = TRUE)
+      
+      # Choose K PCs: min # to explain >= 80% variance, capped at 20
+      pca_sum <- summary(pca_genes)
+      cumvar  <- pca_sum$importance["Cumulative Proportion", ]
+      K_80    <- which(cumvar >= 0.80)[1]
+      if (is.na(K_80)) K_80 <- ncol(pca_genes$x)
+      K <- min(K_80, 20, ncol(pca_genes$x))
+      
+      pc_train <- as.data.frame(pca_genes$x[, 1:K, drop = FALSE])
+      
+      pc_test <- as.data.frame(
+        scale(
+          gene_test_mat,
+          center = pca_genes$center,
+          scale  = pca_genes$scale
+        ) %*% pca_genes$rotation[, 1:K, drop = FALSE]
+      )
+      
+      colnames(pc_train) <- paste0("PC_gene_", seq_len(K))
+      colnames(pc_test)  <- paste0("PC_gene_", seq_len(K))
+      
+      # Remove original gene columns and add PCs
+      predictors_train_pca <- predictors_train_clean %>%
+        dplyr::select(-all_of(gene_cols_final)) %>%
+        dplyr::bind_cols(pc_train)
+      
+      predictors_test_pca <- predictors_test_clean %>%
+        dplyr::select(-all_of(gene_cols_final)) %>%
+        dplyr::bind_cols(pc_test)
+    }
+    
+  } else {
+    # No numeric gene columns
+    predictors_train_pca <- predictors_train_clean
+    predictors_test_pca  <- predictors_test_clean
+  }
+  
+} else {
+  # No mutation gene columns found
+  predictors_train_pca <- predictors_train_clean
+  predictors_test_pca  <- predictors_test_clean
+}
+
+dim(predictors_train_pca)
+dim(predictors_test_pca)
+```
+```{r}
+### Random testing, was not included in the final model###
+### Univariate probability calcuations###
+library(dplyr)
+library(broom)
+
+train_df <- data.frame(
+  y = y_train_bin,          # 0/1 binary outcome
+  predictors_train_final    # your 40-predictor data frame
+)
+# One GLM per predictor
+screen_results <- lapply(names(predictors_train_final), function(v) {
+  # formula: y ~ v
+  f <- reformulate(v, "y")
+  
+  # Fit logistic regression
+  fit <- glm(f, data = train_df, family = binomial)
+  
+  # Extract term + p-value of the predictor (second row of tidy)
+  out <- tidy(fit)
+  out[2, c("term", "p.value")]
+})
+
+# Combine all rows into one data frame
+screen_df <- bind_rows(screen_results)   # safer than do.call(rbind, ...)
+# Order by p-value
+screen_df_ord <- screen_df[order(screen_df$p.value), ]
+```
+
+```{r}
+# Take the top 40 (or fewer if you want stricter)
+top_predictors <- head(screen_df_ord$term, 30)
+
+top_predictors
+
+
+```
+
+
+
+
+```{r}
+# Clinically motivated interactions
+make_interactions <- function(df, vars, prefix = "int_") {
+  out <- df
+  if (length(vars) >= 2) {
+    combs <- t(combn(vars, 2))
+    for (i in seq_len(nrow(combs))) {
+      v1 <- combs[i, 1]
+      v2 <- combs[i, 2]
+      inter_name <- paste0(prefix, v1, "_x_", v2)
+      out[[inter_name]] <- df[[v1]] * df[[v2]]
+    }
+  }
+  out
+}
+
+clin_interact_vars <- intersect(
+  c(
+    "neoplasm_histologic_grade",
+    "tumor_size",
+    "tumor_stage",
+    "nottingham_prognostic_index",
+    "lymph_nodes_examined_positive"
+  ),
+  names(predictors_train_pca)
+)
+
+
+clin_interact_vars
+
+predictors_train_final <- make_interactions(predictors_train_pca, clin_interact_vars)
+predictors_test_final  <- make_interactions(predictors_test_pca,  clin_interact_vars)
+
+dim(predictors_train_final)
+dim(predictors_test_final)
+
+```
+
+```{r}
+library(dplyr)
+
+# Find all PC_gene_ columns
+pc_cols <- grep("^PC_gene_", names(predictors_train_final), value = TRUE)
+
+# Decide how many PCs to keep – e.g., first 10
+pc_keep <- head(pc_cols, 5)   # change 10 → 5 if you want more aggressive
+pc_drop <- setdiff(pc_cols, pc_keep)
+# Find mutation indicator columns
+mut_cols <- grep("_mut$", names(predictors_train_final), value = TRUE)
+
+# Count how many times each mutation is present (== 1)
+mut_counts <- colSums(predictors_train_final[, mut_cols, drop = FALSE] == 1, na.rm = TRUE)
+
+# Drop mutations that appear in fewer than 10 patients (tune this threshold)
+mut_drop <- names(mut_counts)[mut_counts < 10]
+# Columns to drop altogether
+drop_cols <- c(pc_drop, mut_drop)
+
+predictors_train_reduced <- predictors_train_final %>%
+  select(-all_of(drop_cols))
+
+predictors_test_reduced <- predictors_test_final %>%
+  select(-all_of(drop_cols))
+```
+
+```{r}
+dim(predictors_train_reduced)
+dim(predictors_test_reduced)
+length(names(predictors_train_reduced))
+
+```
+
+```{r}
+length(names(predictors_train_reduced))
+names(predictors_train_reduced)
+```
+
+
+### Beginning Testing and Training###
+```{r}
+
+# Model Matrix 
+
+library(Matrix)
+library(caret)
+
+
+# Combine reduced train + test predictors
+pred_all_reduced <- rbind(predictors_train_reduced, predictors_test_reduced)
+
+# Build model matrix (dummy-encode factors, drop intercept)
+mm_formula <- ~ . - 1
+X_all <- model.matrix(mm_formula, data = pred_all_reduced)
+
+# Split back into train and test
+n_train <- nrow(predictors_train_reduced)
+X_train_mat <- X_all[1:n_train, , drop = FALSE]
+X_test_mat  <- X_all[(n_train + 1):nrow(X_all), , drop = FALSE]
+
+# Optional: sparse versions (if you still need them)
+X_train_sp <- as(X_train_mat, "dgCMatrix")
+X_test_sp  <- as(X_test_mat,  "dgCMatrix")
+
+# Numeric outcomes 0/1 for models that need them
+y_train_num <- y_train_bin
+y_test_num  <- y_test_bin
+
+# Factor outcomes for caret
+y_train_fac <- factor(ifelse(y_train_bin == 1, "Yes", "No"),
+                      levels = c("No", "Yes"))
+y_test_fac  <- factor(ifelse(y_test_bin  == 1, "Yes", "No"),
+                      levels = c("No", "Yes"))
+
+# Macro-F1 helper
+macro_f1 <- function(pred, y_true) {
+  pred_fac <- factor(pred, levels = c(0, 1))
+  y_fac    <- factor(y_true, levels = c(0, 1))
+  
+  f1_pos <- F_meas(pred_fac, y_fac, relevant = "1")
+  f1_neg <- F_meas(pred_fac, y_fac, relevant = "0")
+  
+  (f1_pos + f1_neg) / 2
+}
+
+# Total sum of squares for pseudo-R2 on test set
+sst <- sum((y_test_bin - mean(y_test_bin))^2)
+
+# 5-fold, 2-repeat CV, tuned on ROC
+ctrl <- trainControl(
+  method          = "repeatedcv",
+  number          = 5,
+  repeats         = 2,
+  classProbs      = TRUE,
+  summaryFunction = twoClassSummary,  # ROC, Sens, Spec
+  savePredictions = "final",
+  verboseIter     = FALSE
+)
+
+set.seed(123)
+
+
+```
+
+```{r}
+
+set.seed(123)
+
+svm_grid <- expand.grid(
+  C = c(0.25, 1, 4)   # regularization strength grid
+)
+
+svm_fit <- train(
+  x          = X_train_mat,
+  y          = y_train_fac,
+  method     = "svmLinear",
+  trControl  = ctrl,
+  metric     = "ROC",
+  preProcess = c("center", "scale"),
+  tuneGrid   = svm_grid
+)
+prob_svm_test <- predict(svm_fit, newdata = X_test_mat, type = "prob")[, "Yes"]
+pred_svm_test <- ifelse(prob_svm_test >= 0.5, 1, 0)
+```
+
+```{r}
+# Metrics on test set
+acc_svm <- mean(pred_svm_test == y_test_bin)
+
+roc_svm <- roc(y_test_bin, prob_svm_test)
+auc_svm <- as.numeric(auc(roc_svm))
+
+rmse_svm <- sqrt(mean((y_test_bin - prob_svm_test)^2))
+
+sse_svm <- sum((y_test_bin - prob_svm_test)^2)
+r2_svm  <- 1 - sse_svm / sst
+
+f1_macro_svm <- macro_f1(pred_svm_test, y_test_bin)
+acc_svm
+auc_svm
+rmse_svm
+r2_svm
+f1_macro_svm
+
+```
+
+```{r}
+# SVM feature importance
+svm_vi <- varImp(svm_fit, scale = FALSE)
+svm_imp_df <- as.data.frame(svm_vi$importance)
+colnames(svm_imp_df)[1] <- "importance_raw"
+svm_imp_df$feature <- rownames(svm_vi$importance)
+svm_imp_df <- svm_imp_df[, c("feature", "importance_raw")]
+svm_imp_df <- svm_imp_df[order(-svm_imp_df$importance_raw), ]
+top10_svm  <- head(svm_imp_df, 10)
+
+top10_svm
+
+# "Regularization path" for SVM: performance vs C
+svm_tuning_results <- svm_fit$results
+svm_tuning_results
+## Contains: C, ROC, Sens, Spec, etc.
+
+```
+
+
+```{r}
+
+set.seed(123)
+
+p <- ncol(X_train_mat)
+
+rf_grid <- expand.grid(
+  mtry          = floor(c(sqrt(p), p / 4)),
+  splitrule     = "gini",
+  min.node.size = c(5, 10)
+)
+rf_fit <- train(
+  x          = X_train_mat,
+  y          = y_train_fac,
+  method     = "ranger",
+  trControl  = ctrl,
+  metric     = "ROC",
+  tuneGrid   = rf_grid,
+  num.trees  = 300,
+  importance = "impurity"
+)
+
+# Test-set predictions
+prob_rf_test <- predict(rf_fit, newdata = X_test_mat, type = "prob")[, "Yes"]
+pred_rf_test <- ifelse(prob_rf_test >= 0.5, 1, 0)
+```
+
+```{R}
+acc_rf <- mean(pred_rf_test == y_test_bin)
+
+roc_rf <- roc(y_test_bin, prob_rf_test)
+auc_rf <- as.numeric(auc(roc_rf))
+
+rmse_rf <- sqrt(mean((y_test_bin - prob_rf_test)^2))
+
+sse_rf <- sum((y_test_bin - prob_rf_test)^2)
+r2_rf  <- 1 - sse_rf / sst
+
+f1_macro_rf <- macro_f1(pred_rf_test, y_test_bin)
+
+acc_rf
+auc_rf
+rmse_rf
+r2_rf
+f1_macro_rf
+```
+
+```{r}
+# Random Forest feature importance (impurity-based)
+rf_vi <- varImp(rf_fit, scale = FALSE)
+rf_imp_df <- as.data.frame(rf_vi$importance)
+colnames(rf_imp_df)[1] <- "importance_raw"
+rf_imp_df$feature <- rownames(rf_vi$importance)
+rf_imp_df <- rf_imp_df[, c("feature", "importance_raw")]
+rf_imp_df <- rf_imp_df[order(-rf_imp_df$importance_raw), ]
+top10_rf  <- head(rf_imp_df, 10)
+
+top10_rf
+
+# Example tree splits from the final ranger model
+rf_final <- rf_fit$finalModel
+# Extract splits from the first tree
+rf_tree1_info <- treeInfo(rf_final, tree = 1)
+rf_tree1_info
+## This gives node-by-node split variables, split values, and terminal nodes.
+```
+
+
+```{R}
+unique(rf_tree1_info$splitvarName)
+sort(table(rf_tree1_info$splitvarName), decreasing = TRUE)
+```
+
+```{r}
+freq <- sort(table(rf_tree1_info$splitvarName), decreasing = TRUE)
+top_vars <- names(freq)[1:5]
+
+subset(rf_tree1_info, splitvarName %in% top_vars)
+```
+
+```{r}
+
+# "Regularization path" analogue for RF: ROC vs mtry/min.node.size grid
+rf_tuning_results <- rf_fit$results
+rf_tuning_results
+
+
+```
+
+
+```{r}
+set.seed(123)
+
+xgb_grid <- expand.grid(
+  nrounds          = c(100, 200),
+  max_depth        = c(3, 4),
+  eta              = c(0.05, 0.10),
+  gamma            = 0,
+  colsample_bytree = 0.7,
+  min_child_weight = 1,
+  subsample        = 0.8
+)
+
+xgb_fit <- train(
+  x          = X_train_mat,
+  y          = y_train_fac,
+  method     = "xgbTree",
+  trControl  = ctrl,
+  metric     = "ROC",
+  tuneGrid   = xgb_grid
+)
+prob_xgb_test <- predict(xgb_fit, newdata = X_test_mat, type = "prob")[, "Yes"]
+pred_xgb_test <- ifelse(prob_xgb_test >= 0.5, 1, 0)
+
+```
+
+```{r}
+acc_xgb <- mean(pred_xgb_test == y_test_bin)
+
+roc_xgb <- roc(y_test_bin, prob_xgb_test)
+auc_xgb <- as.numeric(auc(roc_xgb))
+
+rmse_xgb <- sqrt(mean((y_test_bin - prob_xgb_test)^2))
+
+sse_xgb <- sum((y_test_bin - prob_xgb_test)^2)
+r2_xgb  <- 1 - sse_xgb / sst
+
+f1_macro_xgb <- macro_f1(pred_xgb_test, y_test_bin)
+
+acc_xgb
+auc_xgb
+rmse_xgb
+r2_xgb
+f1_macro_xgb
+
+```
+
+```{r}
+
+# XGBoost feature importance via caret's varImp
+xgb_vi <- varImp(xgb_fit, scale = FALSE)
+xgb_imp_df <- as.data.frame(xgb_vi$importance)
+colnames(xgb_imp_df)[1] <- "importance_raw"
+xgb_imp_df$feature <- rownames(xgb_vi$importance)
+xgb_imp_df <- xgb_imp_df[, c("feature", "importance_raw")]
+xgb_imp_df <- xgb_imp_df[order(-xgb_imp_df$importance_raw), ]
+top10_xgb  <- head(xgb_imp_df, 10)
+
+top10_xgb
+
+
+```
+
+```{r}
+# Example tree structure from final xgboost model
+xgb_final <- xgb_fit$finalModel
+# Dump tree text (first few trees)
+xgb_tree_dump <- xgb.dump(xgb_final, with_stats = TRUE)
+head(xgb_tree_dump, 40)
+## You can inspect splits, gains, and leaf values here.
+
+# "Regularization path": performance vs hyperparameters
+xgb_tuning_results <- xgb_fit$results
+xgb_tuning_results
+
+```
+
+###Summary Table###
+```{r}
+imp_svm <- top10_svm %>%
+  mutate(
+    model            = "SVM (Linear)",
+    importance_scaled = importance_raw / max(importance_raw),
+    importance_share  = importance_raw / sum(importance_raw)
+  )
+
+imp_rf <- top10_rf %>%
+  mutate(
+    model            = "Random Forest",
+    importance_scaled = importance_raw / max(importance_raw),
+    importance_share  = importance_raw / sum(importance_raw)
+  )
+
+imp_xgb <- top10_xgb %>%
+  mutate(
+    model            = "XGBoost",
+    importance_scaled = importance_raw / max(importance_raw),
+    importance_share  = importance_raw / sum(importance_raw)
+  )
+
+imp_all_long <- bind_rows(imp_svm, imp_rf, imp_xgb)
+imp_wide <- imp_all_long %>%
+  select(feature, model, importance_scaled) %>%
+  pivot_wider(
+    names_from  = model,
+    values_from = importance_scaled
+  )
+
+imp_all_long
+imp_wide
+
+```
+
+```{r}
+
+model_summary <- data.frame(
+  Model = c("SVM (Linear)", "Random Forest", "XGBoost"),
+  
+  Accuracy = c(
+    acc_svm,
+    acc_rf,
+    acc_xgb
+  ),
+  
+  AUC = c(
+    auc_svm,
+    auc_rf,
+    auc_xgb
+  ),
+  
+  F1c_Macro = c(
+    f1_macro_svm,
+    f1_macro_rf,
+    f1_macro_xgb
+  ),
+  
+  RMSE = c(
+    rmse_svm,
+    rmse_rf,
+    rmse_xgb
+  ),
+  
+  R2 = c(
+    r2_svm,
+    r2_rf,
+    r2_xgb
+  )
+)
+
+model_summary_pretty <- model_summary %>%
+  mutate(
+    Accuracy  = round(Accuracy, 4),
+    AUC       = round(AUC, 4),
+    F1c_Macro = round(F1c_Macro, 4),
+    RMSE      = round(RMSE, 4),
+    R2        = round(R2, 4)
+  )
+
+model_summary_pretty
+
+```
+
+### Plots to Analyze Any Features###
+```{r}
+
+#  PDP + ICE CODE FOR SVM, RF, XGB (caret)
+
+
+library(iml)
+library(dplyr)
+
+
+
+X_train_df  <- predictors_train_reduced
+y_train_vec <- y_train_bin    # factor or numeric (caret outcome)
+
+pred_svm_fun <- function(model, newdata) {
+  predict(model, newdata = newdata, type = "prob")[, "Yes"]
+}
+
+pred_rf_fun <- function(model, newdata) {
+  predict(model, newdata = newdata, type = "prob")[, "Yes"]
+}
+
+pred_xgb_fun <- function(model, newdata) {
+  predict(model, newdata = newdata, type = "prob")[, "Yes"]
+}
+
+
+svm_pred_iml <- Predictor$new(
+  model       = svm_fit,
+  data        = X_train_df,
+  y           = y_train_vec,
+  predict.fun = pred_svm_fun
+)
+
+rf_pred_iml <- Predictor$new(
+  model       = rf_fit,
+  data        = X_train_df,
+  y           = y_train_vec,
+  predict.fun = pred_rf_fun
+)
+
+xgb_pred_iml <- Predictor$new(
+  model       = xgb_fit,
+  data        = X_train_df,
+  y           = y_train_vec,
+  predict.fun = pred_xgb_fun
+)
+
+
+vars_of_interest <- c(
+  "age_at_diagnosis",
+  "tumor_size",
+  "lymph_nodes_examined_positive",
+  "nottingham_prognostic_index"
+)
+
+make_pdp_ice <- function(pred_obj, var_name) {
+  FeatureEffect$new(
+    predictor = pred_obj,
+    feature   = var_name,
+    method    = "pdp+ice"
+  )
+}
+
+
+
+### AGE AT DIAGNOSIS
+pdp_ice_svm_age <- make_pdp_ice(svm_pred_iml, "age_at_diagnosis")
+pdp_ice_rf_age  <- make_pdp_ice(rf_pred_iml,  "age_at_diagnosis")
+pdp_ice_xgb_age <- make_pdp_ice(xgb_pred_iml, "age_at_diagnosis")
+
+plot(pdp_ice_svm_age)
+plot(pdp_ice_rf_age)
+plot(pdp_ice_xgb_age)
+
+### TUMOR SIZE
+pdp_ice_svm_tumor <- make_pdp_ice(svm_pred_iml, "tumor_size")
+pdp_ice_rf_tumor  <- make_pdp_ice(rf_pred_iml,  "tumor_size")
+pdp_ice_xgb_tumor <- make_pdp_ice(xgb_pred_iml, "tumor_size")
+
+plot(pdp_ice_svm_tumor)
+plot(pdp_ice_rf_tumor)
+plot(pdp_ice_xgb_tumor)
+
+### LYMPH NODES
+pdp_ice_svm_nodes <- make_pdp_ice(svm_pred_iml, "lymph_nodes_examined_positive")
+pdp_ice_rf_nodes  <- make_pdp_ice(rf_pred_iml,  "lymph_nodes_examined_positive")
+pdp_ice_xgb_nodes <- make_pdp_ice(xgb_pred_iml, "lymph_nodes_examined_positive")
+
+plot(pdp_ice_svm_nodes)
+plot(pdp_ice_rf_nodes)
+plot(pdp_ice_xgb_nodes)
+
+### NOTTINGHAM PROGNOSTIC INDEX
+pdp_ice_svm_npi <- make_pdp_ice(svm_pred_iml, "nottingham_prognostic_index")
+pdp_ice_rf_npi  <- make_pdp_ice(rf_pred_iml,  "nottingham_prognostic_index")
+pdp_ice_xgb_npi <- make_pdp_ice(xgb_pred_iml, "nottingham_prognostic_index")
+
+plot(pdp_ice_svm_npi)
+plot(pdp_ice_rf_npi)
+plot(pdp_ice_xgb_npi)
+
+```
+
+
+```{r}
+library(ggplot2)
+library(pROC)
+library(dplyr)
+library(tidyr)
+
+# ROC objects
+roc_svm <- roc(y_test_bin, prob_svm_test)
+roc_rf  <- roc(y_test_bin, prob_rf_test)
+roc_xgb <- roc(y_test_bin, prob_xgb_test)
+
+# Convert to data frames
+roc_svm_df <- data.frame(
+  fpr   = 1 - roc_svm$specificities,
+  tpr   = roc_svm$sensitivities,
+  model = "SVM (Linear)"
+)
+
+roc_rf_df <- data.frame(
+  fpr   = 1 - roc_rf$specificities,
+  tpr   = roc_rf$sensitivities,
+  model = "Random Forest"
+)
+
+roc_xgb_df <- data.frame(
+  fpr   = 1 - roc_xgb$specificities,
+  tpr   = roc_xgb$sensitivities,
+  model = "XGBoost"
+)
+
+roc_all <- bind_rows(roc_svm_df, roc_rf_df, roc_xgb_df)
+
+ggplot(roc_all, aes(x = fpr, y = tpr, color = model)) +
+  geom_line(size = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(
+    title = "ROC Curves: SVM vs Random Forest vs XGBoost",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+calibration_df <- data.frame(
+  y_true   = y_test_bin,
+  svm_prob = prob_svm_test,
+  rf_prob  = prob_rf_test,
+  xgb_prob = prob_xgb_test
+)
+
+# Function to build calibration table
+make_calib <- function(df, prob_col, model_name, n_bins = 10) {
+  df %>%
+    mutate(
+      prob = .data[[prob_col]],
+      bin  = cut(prob, breaks = seq(0, 1, length.out = n_bins + 1), include.lowest = TRUE)
+    ) %>%
+    group_by(bin) %>%
+    summarise(
+      mean_pred = mean(prob),
+      obs_rate  = mean(y_true),
+      n         = n(),
+      .groups   = "drop"
+    ) %>%
+    mutate(model = model_name)
+}
+
+calib_svm <- make_calib(calibration_df, "svm_prob", "SVM (Linear)")
+calib_rf  <- make_calib(calibration_df, "rf_prob",  "Random Forest")
+calib_xgb <- make_calib(calibration_df, "xgb_prob", "XGBoost")
+
+calib_all <- bind_rows(calib_svm, calib_rf, calib_xgb)
+
+ggplot(calib_all, aes(x = mean_pred, y = obs_rate, color = model)) +
+  geom_line() +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(
+    title = "Calibration Curves by Model",
+    x = "Mean Predicted Probability (per bin)",
+    y = "Observed Survival Rate"
+  ) +
+  theme_minimal()
+
+
+```
+
+```{r}
+# Long format for density by model
+prob_long <- data.frame(
+  y_true   = y_test_bin,
+  svm_prob = prob_svm_test,
+  rf_prob  = prob_rf_test,
+  xgb_prob = prob_xgb_test
+) %>%
+  pivot_longer(
+    cols      = c(svm_prob, rf_prob, xgb_prob),
+    names_to  = "model",
+    values_to = "prob"
+  ) %>%
+  mutate(
+    model = recode(model,
+                   svm_prob = "SVM (Linear)",
+                   rf_prob  = "Random Forest",
+                   xgb_prob = "XGBoost")
+  )
+
+# Overall distributions by model
+ggplot(prob_long, aes(x = prob, fill = model)) +
+  geom_density(alpha = 0.4) +
+  labs(
+    title = "Distribution of Predicted Probabilities by Model",
+    x = "Predicted Probability of Survival (Yes)",
+    y = "Density"
+  ) +
+  theme_minimal()
+
+# Distributions split by true class
+prob_long$y_true_fac <- factor(prob_long$y_true, levels = c(0, 1),
+                               labels = c("Deceased (0)", "Alive (1)"))
+
+ggplot(prob_long, aes(x = prob, fill = model)) +
+  geom_density(alpha = 0.4) +
+  facet_wrap(~ y_true_fac, ncol = 1) +
+  labs(
+    title = "Predicted Probability Distributions by Outcome and Model",
+    x = "Predicted Probability of Survival (Yes)",
+    y = "Density"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+# imp_all_long should have: feature, model, importance_scaled
+# If many features, filter to union of top something:
+top_features <- imp_all_long %>%
+  dplyr::group_by(feature) %>%
+  dplyr::summarise(max_imp = max(importance_scaled), .groups = "drop") %>%
+  dplyr::arrange(desc(max_imp)) %>%
+  dplyr::slice(1:20) %>%
+  dplyr::pull(feature)
+
+imp_plot_df <- imp_all_long %>%
+  filter(feature %in% top_features)
+
+ggplot(imp_plot_df, aes(x = reorder(feature, importance_scaled), 
+                        y = importance_scaled, fill = model)) +
+  geom_col(position = "dodge") +
+  coord_flip() +
+  labs(
+    title = "Standardized Variable Importance",
+    x = "Feature",
+    y = "Relative Importance (scaled within model)"
+  ) +
+  theme_minimal()
+
+```
+
