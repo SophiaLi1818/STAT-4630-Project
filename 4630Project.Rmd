@@ -1192,3 +1192,5 @@ ggplot(imp_plot_df, aes(x = reorder(feature, importance_scaled),
 
 ```
 
+### PDP/ICE ###
+* Insert code*
