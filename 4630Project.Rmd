@@ -850,12 +850,10 @@ pred_svm_test <- ifelse(prob_svm_test >= 0.5, 1, 0)
 acc_svm <- mean(pred_svm_test == y_test_bin)
 roc_svm <- roc(y_test_bin, prob_svm_test)
 auc_svm <- as.numeric(auc(roc_svm))
-rmse_svm <- sqrt(mean((y_test_bin - prob_svm_test)^2))
-sse_svm <- sum((y_test_bin - prob_svm_test)^2)
-r2_svm  <- 1 - sse_svm / sst
+
 f1_macro_svm <- macro_f1(pred_svm_test, y_test_bin)
 
-acc_svm; auc_svm; rmse_svm; r2_svm; f1_macro_svm
+acc_svm; auc_svm; f1_macro_svm
 ```
 
 ```{r}
@@ -887,12 +885,10 @@ pred_rf_test <- ifelse(prob_rf_test >= 0.5, 1, 0)
 acc_rf <- mean(pred_rf_test == y_test_bin)
 roc_rf <- roc(y_test_bin, prob_rf_test)
 auc_rf <- as.numeric(auc(roc_rf))
-rmse_rf <- sqrt(mean((y_test_bin - prob_rf_test)^2))
 sse_rf <- sum((y_test_bin - prob_rf_test)^2)
-r2_rf  <- 1 - sse_rf / sst
 f1_macro_rf <- macro_f1(pred_rf_test, y_test_bin)
 
-acc_rf; auc_rf; rmse_rf; r2_rf; f1_macro_rf
+acc_rf; auc_rf; f1_macro_rf
 ```
 
 ```{r}
@@ -925,12 +921,10 @@ pred_xgb_test <- ifelse(prob_xgb_test >= 0.5, 1, 0)
 acc_xgb <- mean(pred_xgb_test == y_test_bin)
 roc_xgb <- roc(y_test_bin, prob_xgb_test)
 auc_xgb <- as.numeric(auc(roc_xgb))
-rmse_xgb <- sqrt(mean((y_test_bin - prob_xgb_test)^2))
 sse_xgb <- sum((y_test_bin - prob_xgb_test)^2)
-r2_xgb  <- 1 - sse_xgb / sst
 f1_macro_xgb <- macro_f1(pred_xgb_test, y_test_bin)
 
-acc_xgb; auc_xgb; rmse_xgb; r2_xgb; f1_macro_xgb
+acc_xgb; auc_xgb; f1_macro_xgb
 
 
 ```
@@ -1071,18 +1065,6 @@ model_summary <- data.frame(
     f1_macro_svm,
     f1_macro_rf,
     f1_macro_xgb
-  ),
-  
-  RMSE = c(
-    rmse_svm,
-    rmse_rf,
-    rmse_xgb
-  ),
-  
-  R2 = c(
-    r2_svm,
-    r2_rf,
-    r2_xgb
   )
 )
 
@@ -1090,9 +1072,7 @@ model_summary_pretty <- model_summary %>%
   mutate(
     Accuracy = round(Accuracy, 4),
     AUC      = round(AUC, 4),
-    F1_Macro = round(F1_Macro, 4),
-    RMSE     = round(RMSE, 4),
-    R2       = round(R2, 4)
+    F1_Macro = round(F1_Macro, 4)
   )
 
 model_summary_pretty
