@@ -27,7 +27,7 @@ set.seed(123)
 ### EDA and Processing ###
 ```{r}
 # Loading data and calculating basic outcomes
-metabric <- read.csv("C:/Users/afw3uz/Downloads/metabric.csv",
+metabric <- read.csv("METABRIC_RNA_Mutation.csv",
                      stringsAsFactors = FALSE)
 
 # Binary outcome: 0 = Deceased, 1 = Alive
@@ -86,7 +86,7 @@ missing_clin_df <- data.frame(
 
 top_missing <- missing_clin_df %>%
   arrange(desc(missing_prop)) %>%
-  head(20)
+  head(10)
 
 top_missing
 
@@ -95,7 +95,7 @@ ggplot(top_missing, aes(x = reorder(variable, missing_prop),
   geom_col(fill = "#DD8452") +
   coord_flip() +
   labs(
-    title = "Top 20 Clinical Variables by Missingness",
+    title = "Top 10 Clinical Variables by Missingness",
     x = "Variable",
     y = "Proportion Missing"
   ) +
@@ -1219,4 +1219,48 @@ ggplot(imp_plot_df, aes(x = reorder(feature, importance_scaled),
 ```
 
 ### PDP/ICE ###
-* Insert code*
+
+```{r}
+library(iml)
+library(xgboost)
+library(caret)
+
+# data for iml
+X_test_df <- as.data.frame(X_test_mat)
+
+# prediction function for xgboost (returns prob of positive class)
+predict_xgb_prob <- function(model, newdata) {
+  mat <- unname(as.matrix(newdata))           # remove names to avoid feature-name check
+  dm  <- xgboost::xgb.DMatrix(data = mat)
+  predict(model, newdata = dm)               # for binary:logistic this is P(y = 1)
+}
+
+# iml Predictor object using the fitted xgboost model
+xgb_predictor <- Predictor$new(
+  model            = xgb_fit$finalModel,
+  data             = X_test_df,
+  y                = y_test_bin,
+  predict.function = predict_xgb_prob
+)
+
+# top 4 important features from xgboost
+xgb_vi <- varImp(xgb_fit, scale = FALSE)
+xgb_imp_df <- as.data.frame(xgb_vi$importance)
+xgb_imp_df$feature <- rownames(xgb_vi$importance)
+xgb_imp_df <- xgb_imp_df[order(-xgb_imp_df[, 1]), ]
+top_feats <- head(xgb_imp_df$feature, 4)
+
+# PDP + ICE plots for the top 4 features
+pdp_list <- lapply(top_feats, function(f) {
+  FeatureEffect$new(
+    predictor = xgb_predictor,
+    feature   = f,
+    method    = "pdp+ice"
+  )
+})
+
+for (pd in pdp_list) {
+  print(plot(pd))
+}
+
+```
