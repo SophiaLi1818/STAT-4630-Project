@@ -1244,3 +1244,28 @@ for (pd in pdp_list) {
 }
 
 ```
+
+## Model Comparison Table
+```{r}
+install.packages("kableExtra")
+library(dplyr)
+library(knitr)
+library(kableExtra)
+
+model_summary <- data.frame(
+  Model = c("SVM (Linear)", "Random Forest", "XGBoost"),
+  Accuracy = c(acc_svm, acc_rf, acc_xgb),
+  AUC      = c(auc_svm, auc_rf, auc_xgb),
+  F1_Macro = c(f1_macro_svm, f1_macro_rf, f1_macro_xgb)
+)
+
+model_summary_pretty <- model_summary %>%
+  mutate(
+    Accuracy = round(Accuracy, 4),
+    AUC      = round(AUC, 4),
+    F1_Macro = round(F1_Macro, 4)
+  )
+
+kable(model_summary_pretty, format = "html", caption = "Model Comparison: Performance Metrics") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE)
+```
