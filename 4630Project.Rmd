@@ -27,7 +27,7 @@ set.seed(123)
 ### EDA and Processing ###
 ```{r}
 # Loading data and calculating basic outcomes
-metabric <- read.csv("METABRIC_RNA_Mutation.csv",
+metabric <- read.csv("metabric.csv",
                      stringsAsFactors = FALSE)
 
 # Binary outcome: 0 = Deceased, 1 = Alive
@@ -247,9 +247,8 @@ ggplot(
 ```
 
 ```{r}
-# -----------------------------------
-# EDA: Scatterplots with Outcome
-# -----------------------------------
+
+# EDA of Scatterplots with Outcome
 
 if (all(c("neoplasm_histologic_grade", "nottingham_prognostic_index") %in% names(metabric))) {
   ggplot(
@@ -396,9 +395,8 @@ cor_mat
 
 
 ```{r}
-# -----------------------------------
-# EDA: Outlier Check for Numeric Clinical Variables
-# -----------------------------------
+
+# EDA for Outlier Check of Clinical Variables
 
 
 num_clin_df <- metabric[, num_clinical_vars, drop = FALSE]
@@ -607,6 +605,8 @@ dim(predictors_train_clean)
 dim(predictors_test_clean)
 
 ```
+
+
 ```{r}
 # Mutation gene columns present after cleaning
 
@@ -698,6 +698,8 @@ dim(predictors_test_pca)
 
 
 ```
+
+
 ```{r}
 # Single clinically motivated interaction: tumor_size x lymph_nodes_examined_positive
 
@@ -726,6 +728,8 @@ dim(predictors_train_final)
 dim(predictors_test_final)
 
 ```
+
+
 ```{r}
 library(dplyr)
 
@@ -1112,7 +1116,7 @@ calib_xgb <- make_calib(calibration_df, "xgb_prob", "XGBoost")
 
 calib_all <- bind_rows(calib_svm, calib_rf, calib_xgb)
 
-ggplot(calib_all, aes(x = mean_pred, y = obs_rate, color = model)) +
+p_calib <- ggplot(calib_all, aes(x = mean_pred, y = obs_rate, color = model)) +
   geom_line() +
   geom_point() +
   geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
@@ -1123,11 +1127,21 @@ ggplot(calib_all, aes(x = mean_pred, y = obs_rate, color = model)) +
   ) +
   theme_minimal()
 
-
+ggsave(
+  filename = "calibration_curves.png",
+  plot = p_calib,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
 ```
 
 ```{r}
-# Long format for density by model
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+# --- Long format ---
 prob_long <- data.frame(
   y_true   = y_test_bin,
   svm_prob = prob_svm_test,
@@ -1146,8 +1160,10 @@ prob_long <- data.frame(
                    xgb_prob = "XGBoost")
   )
 
-# Overall distributions by model
-ggplot(prob_long, aes(x = prob, fill = model)) +
+# -------------------------------
+# 1. Overall distributions
+# -------------------------------
+p_overall <- ggplot(prob_long, aes(x = prob, fill = model)) +
   geom_density(alpha = 0.4) +
   labs(
     title = "Distribution of Predicted Probabilities by Model",
@@ -1156,11 +1172,26 @@ ggplot(prob_long, aes(x = prob, fill = model)) +
   ) +
   theme_minimal()
 
-# Distributions split by true class
-prob_long$y_true_fac <- factor(prob_long$y_true, levels = c(0, 1),
-                               labels = c("Deceased (0)", "Alive (1)"))
+# Save overall plot
+ggsave(
+  filename = "prob_distribution_models.png",
+  plot = p_overall,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
 
-ggplot(prob_long, aes(x = prob, fill = model)) +
+
+# -------------------------------
+# 2. Distributions split by true class
+# -------------------------------
+prob_long$y_true_fac <- factor(
+  prob_long$y_true,
+  levels = c(0, 1),
+  labels = c("Deceased (0)", "Alive (1)")
+)
+
+p_byclass <- ggplot(prob_long, aes(x = prob, fill = model)) +
   geom_density(alpha = 0.4) +
   facet_wrap(~ y_true_fac, ncol = 1) +
   labs(
@@ -1170,11 +1201,25 @@ ggplot(prob_long, aes(x = prob, fill = model)) +
   ) +
   theme_minimal()
 
+# Save faceted plot
+ggsave(
+  filename = "prob_distribution_by_class.png",
+  plot = p_byclass,
+  width = 8,
+  height = 8,
+  dpi = 300
+)
+
+
 ```
 
 ```{r}
 # imp_all_long should have: feature, model, importance_scaled
 # If many features, filter to union of top something:
+library(dplyr)
+library(ggplot2)
+
+# --- Identify top features ---
 top_features <- imp_all_long %>%
   dplyr::group_by(feature) %>%
   dplyr::summarise(max_imp = max(importance_scaled), .groups = "drop") %>%
@@ -1185,8 +1230,12 @@ top_features <- imp_all_long %>%
 imp_plot_df <- imp_all_long %>%
   filter(feature %in% top_features)
 
-ggplot(imp_plot_df, aes(x = reorder(feature, importance_scaled), 
-                        y = importance_scaled, fill = model)) +
+# --- Build the plot ---
+p_imp <- ggplot(imp_plot_df, aes(
+  x = reorder(feature, importance_scaled),
+  y = importance_scaled,
+  fill = model
+)) +
   geom_col(position = "dodge") +
   coord_flip() +
   labs(
@@ -1195,6 +1244,16 @@ ggplot(imp_plot_df, aes(x = reorder(feature, importance_scaled),
     y = "Relative Importance (scaled within model)"
   ) +
   theme_minimal()
+
+# --- Save plot as PNG ---
+ggsave(
+  filename = "variable_importance.png",
+  plot = p_imp,
+  width = 10,   # horizontal for readability
+  height = 8,
+  dpi = 300
+)
+
 
 ```
 
@@ -1248,12 +1307,15 @@ for (pd in pdp_list) {
 ## Model Comparison Table
 ```{r}
 install.packages("kableExtra")
+install.packages("webshot2")
+
 library(dplyr)
 library(knitr)
 library(kableExtra)
+library(webshot2)
 
 model_summary <- data.frame(
-  Model = c("SVM (Linear)", "Random Forest", "XGBoost"),
+  Model    = c("SVM (Linear)", "Random Forest", "XGBoost"),
   Accuracy = c(acc_svm, acc_rf, acc_xgb),
   AUC      = c(auc_svm, auc_rf, auc_xgb),
   F1_Macro = c(f1_macro_svm, f1_macro_rf, f1_macro_xgb)
@@ -1266,6 +1328,28 @@ model_summary_pretty <- model_summary %>%
     F1_Macro = round(F1_Macro, 4)
   )
 
-kable(model_summary_pretty, format = "html", caption = "Model Comparison: Performance Metrics") %>%
-  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), full_width = FALSE)
+# Create HTML table
+tab_html <- kable(
+  model_summary_pretty,
+  format = "html",
+  caption = "Model Comparison: Performance Metrics"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE
+  )
+
+# Save temporary HTML file
+html_file <- "model_summary_table.html"
+save_kable(tab_html, file = html_file)
+
+# Convert to PNG
+webshot2::webshot(
+  url      = html_file,
+  file     = "model_summary_table.png",
+  vwidth   = 1200,
+  vheight  = 800,
+  zoom     = 2
+)
+
 ```
