@@ -1154,10 +1154,12 @@ prob_long <- data.frame(
     values_to = "prob"
   ) %>%
   mutate(
-    model = recode(model,
-                   svm_prob = "SVM (Linear)",
-                   rf_prob  = "Random Forest",
-                   xgb_prob = "XGBoost")
+    model = recode(
+      model,
+      svm_prob = "SVM (Linear)",
+      rf_prob  = "Random Forest",
+      xgb_prob = "XGBoost"
+    )
   )
 
 # -------------------------------
@@ -1170,9 +1172,24 @@ p_overall <- ggplot(prob_long, aes(x = prob, fill = model)) +
     x = "Predicted Probability of Survival (Yes)",
     y = "Density"
   ) +
-  theme_minimal()
+  theme_minimal() +
+  theme(
+    # --- Darker + clearer text ---
+    text = element_text(color = "black"),
+    axis.text.x = element_text(color = "black", size = 12),
+    axis.text.y = element_text(color = "black", size = 12),
+    axis.title.x = element_text(color = "black", size = 14),
+    axis.title.y = element_text(color = "black", size = 14),
+    plot.title  = element_text(color = "black", size = 16, face = "bold"),
+    legend.text = element_text(color = "black", size = 12),
+    legend.title = element_text(color = "black", size = 12),
 
-# Save overall plot
+    # --- Keep your border ---
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+    plot.background = element_rect(color = "black", fill = "white", linewidth = 0.8)
+  )
+
+
 ggsave(
   filename = "prob_distribution_models.png",
   plot = p_overall,
@@ -1180,7 +1197,6 @@ ggsave(
   height = 6,
   dpi = 300
 )
-
 
 # -------------------------------
 # 2. Distributions split by true class
@@ -1199,9 +1215,25 @@ p_byclass <- ggplot(prob_long, aes(x = prob, fill = model)) +
     x = "Predicted Probability of Survival (Yes)",
     y = "Density"
   ) +
-  theme_minimal()
+  theme_minimal() +
+  theme(
+    # --- Darker + clearer text ---
+    text = element_text(color = "black"),
+    axis.text.x = element_text(color = "black", size = 12),
+    axis.text.y = element_text(color = "black", size = 12),
+    axis.title.x = element_text(color = "black", size = 14),
+    axis.title.y = element_text(color = "black", size = 14),
+    plot.title  = element_text(color = "black", size = 16, face = "bold"),
+    strip.text = element_text(color = "black", size = 14),
+    legend.text = element_text(color = "black", size = 12),
+    legend.title = element_text(color = "black", size = 12),
 
-# Save faceted plot
+    # --- Keep your border ---
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+    plot.background = element_rect(color = "black", fill = "white", linewidth = 0.8)
+  )
+
+
 ggsave(
   filename = "prob_distribution_by_class.png",
   plot = p_byclass,
@@ -1243,7 +1275,23 @@ p_imp <- ggplot(imp_plot_df, aes(
     x = "Feature",
     y = "Relative Importance (scaled within model)"
   ) +
-  theme_minimal()
+  theme_minimal() +
+  theme(
+    # MAKE ALL TEXT DARKER
+    text = element_text(color = "black"),
+    axis.text.x = element_text(color = "black", size = 12),
+    axis.text.y = element_text(color = "black", size = 12),
+    axis.title.x = element_text(color = "black", size = 14),
+    axis.title.y = element_text(color = "black", size = 14),
+    plot.title  = element_text(color = "black", size = 16, face = "bold"),
+    legend.text = element_text(color = "black", size = 12),
+    legend.title = element_text(color = "black", size = 12),
+
+    # keep your border
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
+    plot.background = element_rect(color = "black", fill = "white", linewidth = 0.8)
+  )
+
 
 # --- Save plot as PNG ---
 ggsave(
@@ -1253,6 +1301,44 @@ ggsave(
   height = 8,
   dpi = 300
 )
+
+```
+
+```{r}
+install.packages("magick")
+ggsave(
+  filename = "prob_distribution_models.png",
+  plot = p_overall,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+library(magick)
+
+
+# Choose ONE consistent border thickness
+border_thickness <- "12x12"    # ← you can change this value if needed
+
+```
+
+
+```{r}
+# Overall distribution
+image_read("prob_distribution_models.png") %>%
+  image_border("black", border_thickness) %>%
+  image_write("prob_distribution_models_border.png")
+
+# By-class distribution
+image_read("prob_distribution_by_class.png") %>%
+  image_border("black", border_thickness) %>%
+  image_write("prob_distribution_by_class_border.png")
+```
+
+```{r}
+# Variable importance (same exact border thickness)
+image_read("variable_importance.png") %>%
+  image_border("black", border_thickness) %>%
+  image_write("variable_importance_border.png")
 
 
 ```
