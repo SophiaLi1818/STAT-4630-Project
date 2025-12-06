@@ -4,10 +4,9 @@ output: html_document
 date: "2025-11-18"
 ---
 
-```{r setup, include=FALSE}
+```{r setup, include=FALSE,}
 knitr::opts_chunk$set(echo = TRUE)
 ```
-
 
 ```{r}
 # Setup by downloading all needed packages
@@ -24,6 +23,7 @@ library(corrplot)
 
 set.seed(123)
 ```
+
 ### EDA and Processing ###
 ```{r}
 # Loading data and calculating basic outcomes
@@ -54,6 +54,7 @@ mutation_vars <- names(metabric)[is_gene_col]
 length(clinical_vars)
 length(mutation_vars)
 ```
+
 
 ```{r}
 # EDA with class imbalance
@@ -142,6 +143,7 @@ corrplot(
 )
 ```
 
+
 ```{r}
 # EDA with Mutation Burden
 metabric$mutation_count_raw <- rowSums(mut_mat_full != 0, na.rm = TRUE)
@@ -169,6 +171,7 @@ metabric_long <- metabric %>%
   dplyr::filter(!is.na(value))
 ```
 
+
 ```{r density_plots, fig.width=14, fig.height=10}
 ggplot(metabric_long, aes(x = value, fill = factor(overall_survival))) +
   geom_density(alpha = 0.4) +
@@ -189,6 +192,7 @@ ggplot(metabric_long, aes(x = value, fill = factor(overall_survival))) +
 
 ```
 
+
 ```{r}
 
 # EDA with Stacked Chart
@@ -206,6 +210,7 @@ ggplot(metabric, aes(x = .data[[cat_var]], fill = factor(.data[[outcome_col]])))
 
 
 ```
+
 
 ```{r}
 
@@ -246,6 +251,7 @@ ggplot(
 
 ```
 
+
 ```{r}
 
 # EDA of Scatterplots with Outcome
@@ -273,6 +279,7 @@ if (all(c("neoplasm_histologic_grade", "nottingham_prognostic_index") %in% names
 
 ```
 
+
 ```{r}
 if (all(c("lymph_nodes_examined_positive", "nottingham_prognostic_index") %in% names(metabric))) {
   ggplot(
@@ -293,6 +300,8 @@ if (all(c("lymph_nodes_examined_positive", "nottingham_prognostic_index") %in% n
 }
 
 ```
+
+
 ```{r}
 if (all(c("tumor_size", "tumor_stage") %in% names(metabric))) {
   
@@ -321,6 +330,8 @@ if (all(c("tumor_size", "tumor_stage") %in% names(metabric))) {
 }
 
 ```
+
+
 ```{r}
 if (all(c("nottingham_prognostic_index", "tumor_stage") %in% names(metabric))) {
   
@@ -346,6 +357,8 @@ if (all(c("nottingham_prognostic_index", "tumor_stage") %in% names(metabric))) {
 }
 
 ```
+
+
 ```{r}
 if (all(c("lymph_nodes_examined_positive", "tumor_stage") %in% names(metabric))) {
   
@@ -372,6 +385,7 @@ if (all(c("lymph_nodes_examined_positive", "tumor_stage") %in% names(metabric)))
 
 ```
 
+
 ```{R}
 vars_to_check <- c(
   "neoplasm_histologic_grade",
@@ -395,10 +409,7 @@ cor_mat
 
 
 ```{r}
-
 # EDA for Outlier Check of Clinical Variables
-
-
 num_clin_df <- metabric[, num_clinical_vars, drop = FALSE]
 
 outlier_summary <- apply(
@@ -433,9 +444,9 @@ outlier_summary <- outlier_summary %>%
   dplyr::arrange(dplyr::desc(extreme_ratio))
 
 head(outlier_summary, 15)
-
-
 ```
+
+
 ```{r}
 library(dplyr)
 
@@ -475,6 +486,7 @@ table(y_bin)
 
 ```
 
+
 ```{r}
 # Recompute gene sparsity on cleaned data
 
@@ -513,6 +525,8 @@ length(predictor_vars)
 
 
 ```
+
+
 ```{r}
 library(caret)
 set.seed(123)
@@ -574,6 +588,7 @@ predictors_train <- predictors_all[train_idx, , drop = FALSE]
 predictors_test  <- predictors_all[-train_idx, , drop = FALSE]
 
 ```
+
 
 ```{r}
 num_cols <- sapply(predictors_train, is.numeric)
@@ -696,7 +711,6 @@ predictors_test_pca  <- predictors_test_clean
 dim(predictors_train_pca)
 dim(predictors_test_pca)
 
-
 ```
 
 
@@ -768,6 +782,7 @@ length(names(predictors_train_reduced))
 
 ```
 
+
 ```{r}
 library(Matrix)
 
@@ -827,6 +842,7 @@ verboseIter     = FALSE
 
 ```
 
+
 ```{r}
 library(pROC)
 library(ranger)
@@ -859,6 +875,7 @@ f1_macro_svm <- macro_f1(pred_svm_test, y_test_bin)
 
 acc_svm; auc_svm; f1_macro_svm
 ```
+
 
 ```{r}
 ## ---- Random Forest (ranger) ----
@@ -894,6 +911,7 @@ f1_macro_rf <- macro_f1(pred_rf_test, y_test_bin)
 
 acc_rf; auc_rf; f1_macro_rf
 ```
+
 
 ```{r}
 ## ---- XGBoost ----
@@ -959,6 +977,7 @@ rf_imp_df <- rf_imp_df[order(-rf_imp_df$importance_raw), ]
 top10_rf  <- head(rf_imp_df, 10)
 ```
 
+
 ```{r}
 # XGB var importance
 
@@ -971,8 +990,9 @@ xgb_imp_df <- xgb_imp_df[order(-xgb_imp_df$importance_raw), ]
 top10_xgb  <- head(xgb_imp_df, 10)
 ```
 
+
 ```{r}
-# Combined importance long format (for your later plots)
+# Combined importance long format
 
 imp_svm <- top10_svm %>%
 mutate(
@@ -998,6 +1018,7 @@ importance_share  = importance_raw / sum(importance_raw)
 imp_all_long <- bind_rows(imp_svm, imp_rf, imp_xgb)
 
 ```
+
 
 ```{r}
 imp_all_long
@@ -1048,6 +1069,7 @@ ggplot(roc_all, aes(x = fpr, y = tpr, color = model)) +
   theme_minimal()
 
 ```
+
 
 ```{r}
 model_summary <- data.frame(
@@ -1136,12 +1158,13 @@ ggsave(
 )
 ```
 
+
 ```{r}
 library(dplyr)
 library(tidyr)
 library(ggplot2)
 
-# --- Long format ---
+# Long format 
 prob_long <- data.frame(
   y_true   = y_test_bin,
   svm_prob = prob_svm_test,
@@ -1162,9 +1185,7 @@ prob_long <- data.frame(
     )
   )
 
-# -------------------------------
 # 1. Overall distributions
-# -------------------------------
 p_overall <- ggplot(prob_long, aes(x = prob, fill = model)) +
   geom_density(alpha = 0.4) +
   labs(
@@ -1174,7 +1195,7 @@ p_overall <- ggplot(prob_long, aes(x = prob, fill = model)) +
   ) +
   theme_minimal() +
   theme(
-    # --- Darker + clearer text ---
+    # Darker + clearer text
     text = element_text(color = "black"),
     axis.text.x = element_text(color = "black", size = 12),
     axis.text.y = element_text(color = "black", size = 12),
@@ -1184,7 +1205,7 @@ p_overall <- ggplot(prob_long, aes(x = prob, fill = model)) +
     legend.text = element_text(color = "black", size = 12),
     legend.title = element_text(color = "black", size = 12),
 
-    # --- Keep your border ---
+    # Keep border
     panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
     plot.background = element_rect(color = "black", fill = "white", linewidth = 0.8)
   )
@@ -1198,9 +1219,7 @@ ggsave(
   dpi = 300
 )
 
-# -------------------------------
 # 2. Distributions split by true class
-# -------------------------------
 prob_long$y_true_fac <- factor(
   prob_long$y_true,
   levels = c(0, 1),
@@ -1217,7 +1236,7 @@ p_byclass <- ggplot(prob_long, aes(x = prob, fill = model)) +
   ) +
   theme_minimal() +
   theme(
-    # --- Darker + clearer text ---
+    # Darker + clearer text
     text = element_text(color = "black"),
     axis.text.x = element_text(color = "black", size = 12),
     axis.text.y = element_text(color = "black", size = 12),
@@ -1228,7 +1247,7 @@ p_byclass <- ggplot(prob_long, aes(x = prob, fill = model)) +
     legend.text = element_text(color = "black", size = 12),
     legend.title = element_text(color = "black", size = 12),
 
-    # --- Keep your border ---
+    # Keep border
     panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
     plot.background = element_rect(color = "black", fill = "white", linewidth = 0.8)
   )
@@ -1245,13 +1264,14 @@ ggsave(
 
 ```
 
+
 ```{r}
 # imp_all_long should have: feature, model, importance_scaled
 # If many features, filter to union of top something:
 library(dplyr)
 library(ggplot2)
 
-# --- Identify top features ---
+# Identify top features
 top_features <- imp_all_long %>%
   dplyr::group_by(feature) %>%
   dplyr::summarise(max_imp = max(importance_scaled), .groups = "drop") %>%
@@ -1262,7 +1282,7 @@ top_features <- imp_all_long %>%
 imp_plot_df <- imp_all_long %>%
   filter(feature %in% top_features)
 
-# --- Build the plot ---
+# Build the plot
 p_imp <- ggplot(imp_plot_df, aes(
   x = reorder(feature, importance_scaled),
   y = importance_scaled,
@@ -1287,13 +1307,11 @@ p_imp <- ggplot(imp_plot_df, aes(
     legend.text = element_text(color = "black", size = 12),
     legend.title = element_text(color = "black", size = 12),
 
-    # keep your border
+    # keep border
     panel.border = element_rect(color = "black", fill = NA, linewidth = 0.8),
     plot.background = element_rect(color = "black", fill = "white", linewidth = 0.8)
   )
 
-
-# --- Save plot as PNG ---
 ggsave(
   filename = "variable_importance.png",
   plot = p_imp,
@@ -1304,8 +1322,9 @@ ggsave(
 
 ```
 
+
 ```{r}
-install.packages("magick")
+#install.packages("magick")
 ggsave(
   filename = "prob_distribution_models.png",
   plot = p_overall,
@@ -1316,8 +1335,8 @@ ggsave(
 library(magick)
 
 
-# Choose ONE consistent border thickness
-border_thickness <- "12x12"    # ← you can change this value if needed
+# Choose consistent border thickness
+border_thickness <- "12x12"   
 
 ```
 
@@ -1334,13 +1353,12 @@ image_read("prob_distribution_by_class.png") %>%
   image_write("prob_distribution_by_class_border.png")
 ```
 
+
 ```{r}
 # Variable importance (same exact border thickness)
 image_read("variable_importance.png") %>%
   image_border("black", border_thickness) %>%
   image_write("variable_importance_border.png")
-
-
 ```
 
 ### PDP/ICE ###
@@ -1392,8 +1410,8 @@ for (pd in pdp_list) {
 
 ## Model Comparison Table
 ```{r}
-install.packages("kableExtra")
-install.packages("webshot2")
+#install.packages("kableExtra")
+#install.packages("webshot2")
 
 library(dplyr)
 library(knitr)
@@ -1425,7 +1443,6 @@ tab_html <- kable(
     full_width = FALSE
   )
 
-# Save temporary HTML file
 html_file <- "model_summary_table.html"
 save_kable(tab_html, file = html_file)
 
